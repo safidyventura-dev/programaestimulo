@@ -1202,9 +1202,9 @@ async function ingresarLibro(libro) {
       setFeedback('exito', `¡Registrado! (${r.cantidad}/${app.limite})`, descripcion, libro.valor);
     }
 
-    if (r.cantidad === app.limite) {
-      toast(`Llegaste al límite sugerido de ${app.limite} libros. Podés cerrar la caja.`, 'warning');
-    }
+    // Sin await: el modal queda abierto (y la cámara sin leer) hasta que el operario elija,
+    // pero este registro termina ya y libera `app.enviando` para poder cerrar la caja.
+    if (r.cantidad === app.limite) sugerirCerrarCaja();
     return true;
   } catch (e) {
     if (manejarErrorSesion(e)) return false;
@@ -1345,15 +1345,40 @@ async function onCerrarManual() {
   const ok = await confirmar(
     'Cerrar caja',
     `Vas a cerrar la caja <b>${escaparHtml(app.caja)}</b> con <b>${app.cantidad}</b> libro(s) (límite sugerido: ${app.limite}).` +
-      (app.contenido.length !== new Set(app.contenido.map((l) => l.valor)).size
-        ? '<div class="alert alert-warning py-2 my-2"><i class="bi bi-exclamation-triangle-fill"></i> La caja tiene libros repetidos.</div>'
-        : '<br>') +
+      avisoRepetidosHtml() +
       'Esta acción no se puede deshacer desde la app.',
     'Cerrar caja',
     'btn-danger'
   );
-  if (!ok) return;
+  if (ok) await cerrarCajaActual();
+}
 
+/** Aviso (o salto de línea) para los modales de cierre según haya repetidos en la caja. */
+function avisoRepetidosHtml() {
+  return app.contenido.length !== new Set(app.contenido.map((l) => l.valor)).size
+    ? '<div class="alert alert-warning py-2 my-2"><i class="bi bi-exclamation-triangle-fill"></i> La caja tiene libros repetidos.</div>'
+    : '<br>';
+}
+
+/**
+ * Al llegar justo al límite sugerido se ofrece cerrar la caja ahí mismo.
+ * Mientras el modal está abierto la cámara no lee (app.modalAbierto).
+ */
+async function sugerirCerrarCaja() {
+  const ok = await confirmar(
+    'Caja completa',
+    `La caja <b>${escaparHtml(app.caja)}</b> llegó al límite sugerido de <b>${app.limite}</b> libros.` +
+      avisoRepetidosHtml() +
+      '¿La cerrás ahora? Si cerrás, no se puede deshacer desde la app.',
+    'Cerrar caja',
+    'btn-danger',
+    'Seguir escaneando'
+  );
+  if (ok) await cerrarCajaActual();
+}
+
+async function cerrarCajaActual() {
+  if (!app.caja) return;
   mostrarCargando('Cerrando caja…');
   try {
     const r = await llamarServidor('cerrarCaja', app.sesion.token, app.caja);
@@ -1792,7 +1817,7 @@ function onCambiarTema() {
  * Modal de confirmación basado en Bootstrap. Devuelve Promise<boolean>.
  * `mensajeHtml` debe venir ya escapado si contiene datos ingresados.
  */
-function confirmar(titulo, mensajeHtml, textoAceptar, claseBoton) {
+function confirmar(titulo, mensajeHtml, textoAceptar, claseBoton, textoCancelar) {
   return new Promise((resolve) => {
     const el = $('modal-confirmar');
     const modal = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
@@ -1804,6 +1829,7 @@ function confirmar(titulo, mensajeHtml, textoAceptar, claseBoton) {
     const si = $('confirmar-si');
     si.textContent = textoAceptar || 'Aceptar';
     si.className = 'btn btn-lg flex-fill ' + (claseBoton || 'btn-primary');
+    $('confirmar-no').textContent = textoCancelar || 'Cancelar';
 
     const onSi = () => { respuesta = true; modal.hide(); };
     const onNo = () => { respuesta = false; modal.hide(); };
