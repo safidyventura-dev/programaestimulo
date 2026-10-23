@@ -58,6 +58,7 @@ const app = {
   ultimaLectura: '',       // último código leído (para no registrarlo dos veces seguidas)
   ultimaLecturaTs: 0,
   linterna: false,
+  buscandoLinterna: false, // probando otras cámaras traseras para encontrar flash
 
   caja: null,              // id de la caja en curso
   cantidad: 0,             // libros cargados en la caja en curso
@@ -1387,17 +1388,15 @@ async function iniciarCamara() {
         verbose: false
       });
     }
-    await app.camara.start(
-      { facingMode: 'environment' },
-      {
-        fps: 12,
-        // Recuadro ancho y bajo: el formato de un código de barras.
-        qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(Math.min(h * 0.55, w * 0.45)) }),
-        videoConstraints: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
-      },
-      onLecturaCamara,
-      () => { /* frame sin código: normal */ }
-    );
+    // Si antes se encontró una cámara trasera con linterna, se usa esa directamente.
+    const idGuardado = camaraConLinternaGuardada();
+    try {
+      await arrancarCamara(idGuardado);
+    } catch (e) {
+      if (!idGuardado) throw e;
+      guardarCamaraConLinterna(null); // esa cámara ya no existe o no responde
+      await arrancarCamara(null);
+    }
     app.camaraActiva = true;
     estadoCamara('ok');
     configurarLinterna();
@@ -1417,10 +1416,33 @@ async function iniciarCamara() {
   }
 }
 
+/**
+ * Arranca html5-qrcode. Con `deviceId` usa esa cámara puntual; si no, la trasera por defecto.
+ * (html5-qrcode usa `videoConstraints` en lugar del primer argumento cuando está presente.)
+ */
+async function arrancarCamara(deviceId) {
+  const base = { width: { ideal: 1280 }, height: { ideal: 720 } };
+  const videoConstraints = deviceId
+    ? { ...base, deviceId: { exact: deviceId } }
+    : { ...base, facingMode: { ideal: 'environment' } };
+  await app.camara.start(
+    { facingMode: 'environment' },
+    {
+      fps: 12,
+      // Recuadro ancho y bajo: el formato de un código de barras.
+      qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(Math.min(h * 0.55, w * 0.45)) }),
+      videoConstraints
+    },
+    onLecturaCamara,
+    () => { /* frame sin código: normal */ }
+  );
+}
+
 async function detenerCamara() {
   if (!app.camara || !app.camaraActiva) return;
   app.camaraActiva = false;
   app.linterna = false;
+  actualizarBotonLinterna();
   $('btn-linterna').classList.add('d-none');
   try { await app.camara.stop(); } catch (e) { /* ya estaba detenida */ }
 }
@@ -1463,25 +1485,144 @@ async function onLecturaCamara(texto) {
   }
 }
 
-/** Muestra el botón de linterna si la cámara lo soporta. */
-function configurarLinterna() {
+/* ----------------------------------------------------------------------------
+ *  LINTERNA
+ *  Muchos celulares tienen varias cámaras traseras y el navegador elige una
+ *  (gran angular, macro…) que no tiene flash. Además, en varios Android las
+ *  capacidades del video recién aparecen un momento después de arrancar.
+ *  Por eso el botón se muestra siempre y, si la cámara actual no tiene linterna,
+ *  se prueba con las otras cámaras traseras y se recuerda la que sí la tiene.
+ * -------------------------------------------------------------------------- */
+
+const CLAVE_CAMARA_LINTERNA = 'pe_camara_linterna';
+
+function camaraConLinternaGuardada() {
+  try { return localStorage.getItem(CLAVE_CAMARA_LINTERNA) || null; } catch (e) { return null; }
+}
+
+function guardarCamaraConLinterna(id) {
   try {
-    const torch = app.camara.getRunningTrackCameraCapabilities().torchFeature();
-    $('btn-linterna').classList.toggle('d-none', !torch.isSupported());
+    if (id) localStorage.setItem(CLAVE_CAMARA_LINTERNA, id);
+    else localStorage.removeItem(CLAVE_CAMARA_LINTERNA);
+  } catch (e) { /* sin almacenamiento */ }
+}
+
+/** Pista de video que está usando la cámara en vivo. */
+function pistaVideo() {
+  const video = document.querySelector('#lector-vivo video');
+  const stream = video && video.srcObject;
+  return (stream && stream.getVideoTracks && stream.getVideoTracks()[0]) || null;
+}
+
+/** ¿La pista soporta linterna? Reintenta un rato porque algunos Android la informan tarde. */
+async function pistaTieneLinterna(intentos = 4) {
+  for (let i = 0; i < intentos; i++) {
+    const pista = pistaVideo();
+    if (pista && typeof pista.getCapabilities === 'function') {
+      const cap = pista.getCapabilities() || {};
+      if (cap.torch) return true;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return false;
+}
+
+async function aplicarLinterna(prender) {
+  const pista = pistaVideo();
+  if (!pista) throw new Error('sin cámara');
+  try {
+    await pista.applyConstraints({ advanced: [{ torch: prender }] });
   } catch (e) {
-    $('btn-linterna').classList.add('d-none');
+    await pista.applyConstraints({ torch: prender }); // sintaxis alternativa de algunos navegadores
   }
 }
 
+function actualizarBotonLinterna() {
+  const btn = $('btn-linterna');
+  btn.classList.toggle('btn-warning', app.linterna);
+  btn.classList.toggle('btn-dark', !app.linterna);
+  btn.setAttribute('aria-pressed', String(app.linterna));
+}
+
+/** Muestra el botón de linterna siempre que la cámara esté andando. */
+function configurarLinterna() {
+  app.linterna = false;
+  actualizarBotonLinterna();
+  $('btn-linterna').classList.remove('d-none');
+}
+
+/** Cámaras traseras distintas de la actual, para buscar una que tenga flash. */
+async function otrasCamarasTraseras() {
+  const pista = pistaVideo();
+  const actual = pista && pista.getSettings ? pista.getSettings().deviceId : null;
+  let camaras = [];
+  try { camaras = await Html5Qrcode.getCameras(); } catch (e) { return []; }
+  const otras = camaras.filter((c) => c.id !== actual);
+  const traseras = otras.filter((c) => /back|rear|trasera|posterior|environment|0, facing back/i.test(c.label));
+  return traseras.length ? traseras : otras;
+}
+
+/** Recorre las otras cámaras traseras hasta dar con una que tenga linterna. */
+async function buscarCamaraConLinterna() {
+  const candidatas = await otrasCamarasTraseras();
+  for (const cam of candidatas) {
+    if (!app.camaraActiva) return false; // el operario salió de la pantalla mientras se buscaba
+    try { await app.camara.stop(); } catch (e) { /* ya estaba detenida */ }
+    try {
+      await arrancarCamara(cam.id);
+      if (await pistaTieneLinterna()) {
+        guardarCamaraConLinterna(cam.id);
+        return true;
+      }
+    } catch (e) { /* esa cámara no arrancó: se prueba la siguiente */ }
+  }
+  // Ninguna tiene linterna: se vuelve a la cámara por defecto.
+  try { await app.camara.stop(); } catch (e) { /* ya estaba detenida */ }
+  if (app.camaraActiva) await arrancarCamara(null);
+  return false;
+}
+
 async function onLinterna() {
+  if (!app.camaraActiva || app.buscandoLinterna) return;
+  const btn = $('btn-linterna');
+
+  if (app.linterna) {
+    try { await aplicarLinterna(false); } catch (e) { /* se apagó sola */ }
+    app.linterna = false;
+    actualizarBotonLinterna();
+    return;
+  }
+
+  app.buscandoLinterna = true;
+  btn.disabled = true;
   try {
-    const torch = app.camara.getRunningTrackCameraCapabilities().torchFeature();
-    app.linterna = !app.linterna;
-    await torch.apply(app.linterna);
-    $('btn-linterna').classList.toggle('btn-warning', app.linterna);
-    $('btn-linterna').classList.toggle('btn-dark', !app.linterna);
+    let soportada = await pistaTieneLinterna();
+    if (!soportada) {
+      estadoCamara('cargando', 'Buscando una cámara con linterna…');
+      soportada = await buscarCamaraConLinterna();
+      estadoCamara('ok');
+    }
+    if (!soportada) {
+      toast('Este celular no deja prender la linterna desde el navegador. ' +
+            'Con poca luz usá "Usar foto": la cámara del celular sí tiene flash.', 'warning');
+      return;
+    }
+    await aplicarLinterna(true);
+    app.linterna = true;
+    actualizarBotonLinterna();
   } catch (e) {
-    toast('No se pudo prender la linterna.', 'warning');
+    if (pistaVideo()) {
+      estadoCamara('ok');
+    } else {
+      // La cámara quedó apagada al probar otras: se ofrece reactivarla.
+      app.camaraActiva = false;
+      btn.classList.add('d-none');
+      estadoCamara('error', 'Se apagó la cámara al buscar la linterna. Tocá "Activar cámara".');
+    }
+    toast('No se pudo prender la linterna. Probá con "Usar foto".', 'warning');
+  } finally {
+    app.buscandoLinterna = false;
+    btn.disabled = false;
   }
 }
 

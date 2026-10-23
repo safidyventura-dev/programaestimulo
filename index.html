@@ -460,40 +460,7 @@
   <section id="pantalla-caja" class="pantalla">
     <div class="container py-3" style="max-width: 560px;">
 
-      <!-- Contador -->
-      <div class="card tarjeta-contador mb-3">
-        <div class="card-body py-2">
-          <div class="d-flex justify-content-between align-items-start mb-2">
-            <div>
-              <div class="small text-body-secondary">Caja</div>
-              <div class="h5 fw-bold mb-0" id="caja-id">—</div>
-            </div>
-            <div class="text-end">
-              <div class="small text-body-secondary">Libros / límite sugerido</div>
-              <div><span class="contador-numero" id="contador">0</span>
-                <span class="fs-4 text-body-secondary fw-semibold">/ <span id="contador-max">20</span></span></div>
-            </div>
-          </div>
-          <div class="progress" role="progressbar" aria-label="Progreso de la caja">
-            <div class="progress-bar bg-success" id="barra-progreso" style="width:0%"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Feedback del último ingreso -->
-      <div id="feedback-ingreso" class="feedback-neutral p-3 mb-3 d-flex align-items-center gap-2" aria-live="polite">
-        <i class="bi bi-info-circle fs-4" id="feedback-icono"></i>
-        <div class="flex-grow-1">
-          <div class="fw-semibold" id="feedback-titulo">Listo para cargar libros</div>
-          <div class="small" id="feedback-detalle">Escaneá el código o buscá por título / editorial.</div>
-        </div>
-        <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0 d-none" id="btn-deshacer"
-                style="min-height:40px;" aria-label="Deshacer el último escaneo">
-          <i class="bi bi-arrow-counterclockwise"></i> Deshacer
-        </button>
-      </div>
-
-      <!-- Selector de modo -->
+      <!-- Selector de modo (arriba de todo, junto con el visor, para que el operario lo vea primero) -->
       <div class="btn-group w-100 mb-3 selector-modo" role="group" aria-label="Modo de ingreso">
         <input type="radio" class="btn-check" name="modo" id="modo-escaner" value="escaner" checked>
         <label class="btn btn-outline-primary" for="modo-escaner"><i class="bi bi-upc-scan"></i> Escanear</label>
@@ -539,6 +506,39 @@
         </div>
         <div class="small text-body-secondary mb-2" id="busqueda-info"></div>
         <div class="list-group mb-3" id="resultados-busqueda"></div>
+      </div>
+
+      <!-- Feedback del último ingreso (justo debajo del visor) -->
+      <div id="feedback-ingreso" class="feedback-neutral p-3 mb-3 d-flex align-items-center gap-2" aria-live="polite">
+        <i class="bi bi-info-circle fs-4" id="feedback-icono"></i>
+        <div class="flex-grow-1">
+          <div class="fw-semibold" id="feedback-titulo">Listo para cargar libros</div>
+          <div class="small" id="feedback-detalle">Escaneá el código o buscá por título / editorial.</div>
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0 d-none" id="btn-deshacer"
+                style="min-height:40px;" aria-label="Deshacer el último escaneo">
+          <i class="bi bi-arrow-counterclockwise"></i> Deshacer
+        </button>
+      </div>
+
+      <!-- Contador -->
+      <div class="card tarjeta-contador mb-3">
+        <div class="card-body py-2">
+          <div class="d-flex justify-content-between align-items-start mb-2">
+            <div>
+              <div class="small text-body-secondary">Caja</div>
+              <div class="h5 fw-bold mb-0" id="caja-id">—</div>
+            </div>
+            <div class="text-end">
+              <div class="small text-body-secondary">Libros / límite sugerido</div>
+              <div><span class="contador-numero" id="contador">0</span>
+                <span class="fs-4 text-body-secondary fw-semibold">/ <span id="contador-max">20</span></span></div>
+            </div>
+          </div>
+          <div class="progress" role="progressbar" aria-label="Progreso de la caja">
+            <div class="progress-bar bg-success" id="barra-progreso" style="width:0%"></div>
+          </div>
+        </div>
       </div>
 
       <!-- Contenido completo de la caja (los repetidos se resaltan) -->
