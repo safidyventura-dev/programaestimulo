@@ -463,6 +463,15 @@
   <section id="pantalla-caja" class="pantalla">
     <div class="container py-3" style="max-width: 560px;">
 
+      <!-- Solo Admin: editando una caja ya armada -->
+      <div class="alert alert-info d-flex align-items-center gap-2 py-2 mb-3 d-none" id="aviso-edicion" role="status">
+        <i class="bi bi-pencil-square fs-4"></i>
+        <div>
+          <div class="fw-semibold">Editando caja (administración)</div>
+          <div class="small" id="aviso-edicion-detalle"></div>
+        </div>
+      </div>
+
       <!-- Selector de modo (arriba de todo, junto con el visor, para que el operario lo vea primero) -->
       <div class="btn-group w-100 mb-3 selector-modo" role="group" aria-label="Modo de ingreso">
         <input type="radio" class="btn-check" name="modo" id="modo-escaner" value="escaner" checked>

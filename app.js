@@ -68,6 +68,7 @@ const app = {
   colaTimer: null,         // reintento programado
   colaReintentos: 0,
   colaSinConexion: false,  // el último intento falló por red
+  edicion: false,          // Admin editando una caja ya armada (puede estar cerrada)
   contenido: [],           // libros de la caja en curso: [{ valor, titulo, editorial, origen, hora }]
 
   lectorFoto: null,        // instancia Html5Qrcode usada para leer fotos
@@ -410,6 +411,8 @@ async function consultarCaja(idCaja) {
         <span class="badge ${c.estado === 'Cerrada' ? 'text-bg-secondary' : 'text-bg-primary'}">${escaparHtml(c.estado)}</span>
         <span class="badge ${claseBadgeLimite(c.cantidad, c.max)}">${c.cantidad}/${c.max} libros</span>
         ${repetidos ? `<span class="badge text-bg-warning"><i class="bi bi-exclamation-triangle"></i> ${repetidos} repetido(s)</span>` : ''}
+        ${app.sesion.rol === 'Admin' ? `<button type="button" class="btn btn-outline-primary btn-sm btn-editar-caja ms-auto" style="min-height:36px;">
+          <i class="bi bi-pencil-square"></i> Editar contenido</button>` : ''}
       </div>
       ${c.usuarioCierre ? `<div class="small text-muted mb-2">Cerrada por ${escaparHtml(c.usuarioCierre)}${c.fechaCierre ? ' · ' + escaparHtml(c.fechaCierre) : ''}</div>` : ''}
       ${c.libros.length
@@ -881,6 +884,8 @@ function mostrarMenu() {
   app.caja = null;
   app.cantidad = 0;
   app.contenido = [];
+  app.edicion = false;
+  aplicarModoEdicion();
   detenerCamara();
   $('btn-volver-panel').classList.toggle('d-none', !(app.sesion && app.sesion.rol === 'Admin'));
   mostrarPantalla('pantalla-menu');
@@ -1031,13 +1036,20 @@ async function mostrarCajaCerrada(idCaja) {
 }
 
 /** Abre la caja elegida y pasa a la pantalla de carga de libros. */
-async function abrirCajaSeleccionada(idCaja) {
+/**
+ * @param {boolean=} edicion  Solo Admin: editar el contenido de una caja ya armada
+ *                            (puede estar cerrada y sigue cerrada).
+ */
+async function abrirCajaSeleccionada(idCaja, edicion = false) {
   // Si quedaron libros de esta caja sin guardar, se intenta guardarlos antes de leerla.
   await esperarCola('Guardando', idCaja);
   mostrarCargando('Abriendo caja ' + idCaja + '…');
   try {
-    const info = await llamarServidor('abrirCaja', app.sesion.token, idCaja);
+    const info = await llamarServidor('abrirCaja', app.sesion.token, idCaja, edicion);
+    detenerAutoRefrescoAdmin();
     app.caja = info.id;
+    app.edicion = edicion;
+    aplicarModoEdicion(info.estado);
     aplicarContenidoServidor(info);
     app.limite = info.max || app.limite;
 
@@ -1371,7 +1383,8 @@ async function ingresarLibro(libro) {
     caja: app.caja,
     valor: libro.valor,
     titulo: libro.titulo || '',
-    editorial: libro.editorial || ''
+    editorial: libro.editorial || '',
+    edicion: app.edicion
   };
   app.contenido.push({
     id: lectura.id,
@@ -1401,7 +1414,8 @@ async function ingresarLibro(libro) {
   }
 
   // Sin await: el modal queda abierto (y la cámara sin leer) hasta que el operario elija.
-  if (app.cantidad === app.limite) sugerirCerrarCaja();
+  // Al editar una caja armada no se sugiere cerrarla.
+  if (app.cantidad === app.limite && !app.edicion) sugerirCerrarCaja();
   return true;
 }
 
@@ -1473,7 +1487,8 @@ async function procesarCola() {
 
   try {
     const r = await llamarServidor('registrarLibros', app.sesion.token, caja,
-      lote.map(({ id, valor, titulo, editorial }) => ({ id, valor, titulo, editorial })));
+      lote.map(({ id, valor, titulo, editorial }) => ({ id, valor, titulo, editorial })),
+      lote.some((l) => l.edicion)); // edición de una caja armada (solo Admin)
 
     quitarDeCola(app.colaEnviando);
     app.colaReintentos = 0;
@@ -1608,7 +1623,7 @@ function aplicarContenidoServidor(info) {
 async function resincronizarCaja() {
   if (!app.caja) return;
   try {
-    const info = await llamarServidor('abrirCaja', app.sesion.token, app.caja);
+    const info = await llamarServidor('abrirCaja', app.sesion.token, app.caja, app.edicion);
     const antes = app.cantidad;
     aplicarContenidoServidor(info);
     actualizarContador(false);
@@ -1773,6 +1788,7 @@ async function onVolverMenu() {
     toast('Esperá a que termine de sacarse el libro de la caja.', 'warning');
     return;
   }
+  if (app.edicion) return terminarEdicion();
   const ok = app.cantidad > 0
     ? await confirmar('Volver al menú',
         `La caja <b>${escaparHtml(app.caja)}</b> quedará <b>disponible</b> con ${app.cantidad} libro(s). Podés retomarla después.`,
@@ -1782,6 +1798,53 @@ async function onVolverMenu() {
   // Se intenta guardar lo pendiente; si no hay conexión se sigue reintentando desde el menú.
   await esperarCola();
   mostrarMenu();
+}
+
+/* ============================================================================
+ *  EDICIÓN DE CAJAS ARMADAS (solo Admin)
+ *  Usa la misma pantalla de carga: se escanea o busca para agregar y se sacan
+ *  libros desde la lista. La caja conserva su estado (si estaba cerrada, sigue
+ *  cerrada) y al terminar se vuelve al panel con la caja consultada.
+ * ========================================================================== */
+
+/** Panel admin → "Editar contenido" de la caja consultada. */
+function onEditarCajaConsultada() {
+  if (!app.sesion || app.sesion.rol !== 'Admin' || !app.cajaConsultada) return;
+  cargarCatalogo(); // el panel no lo necesita, pero para agregar libros sí
+  abrirCajaSeleccionada(app.cajaConsultada, true);
+}
+
+/** Muestra u oculta lo propio del modo edición en la pantalla de caja. */
+function aplicarModoEdicion(estado) {
+  const edicion = !!app.edicion;
+  $('aviso-edicion').classList.toggle('d-none', !edicion);
+  if (edicion) {
+    $('aviso-edicion-detalle').textContent = estado === 'Cerrada'
+      ? 'La caja está cerrada y sigue cerrada: los cambios se guardan igual.'
+      : 'La caja está abierta: los operarios también pueden seguir cargándola.';
+  }
+  $('btn-cerrar-manual').classList.toggle('d-none', edicion);
+  $('btn-volver-menu').innerHTML = edicion
+    ? '<i class="bi bi-check2-circle"></i> Terminar edición y volver al panel'
+    : '<i class="bi bi-arrow-left"></i> Volver al menú (la caja queda abierta)';
+  $('btn-volver-menu').className = edicion ? 'btn btn-primary btn-lg' : 'btn btn-link text-secondary';
+}
+
+async function terminarEdicion() {
+  const idCaja = app.caja;
+  if (!(await esperarCola())) return; // sin conexión: se queda editando hasta que se guarde
+
+  detenerCamara();
+  app.caja = null;
+  app.cantidad = 0;
+  app.contenido = [];
+  app.edicion = false;
+  aplicarModoEdicion();
+
+  irAlPanel();
+  $('input-consulta-caja').value = idCaja;
+  consultarCaja(idCaja);
+  toast('Edición de la caja ' + idCaja + ' terminada.', 'success');
 }
 
 /* ============================================================================
@@ -2303,6 +2366,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-volver-panel').addEventListener('click', irAlPanel);
   $('form-consulta-caja').addEventListener('submit', onConsultarCaja);
   $('resultado-consulta-caja').addEventListener('click', onQuitarEnConsulta);
+  $('resultado-consulta-caja').addEventListener('click', (e) => {
+    if (e.target.closest('.btn-editar-caja')) onEditarCajaConsultada();
+  });
   $('resultado-consulta-caja').addEventListener('click', onTocarFila);
   $('resultado-consulta-caja').addEventListener('change', onCambioSeleccion);
 
