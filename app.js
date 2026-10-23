@@ -393,7 +393,8 @@ async function consultarCaja(idCaja) {
       </div>
       ${c.usuarioCierre ? `<div class="small text-muted mb-2">Cerrada por ${escaparHtml(c.usuarioCierre)}${c.fechaCierre ? ' · ' + escaparHtml(c.fechaCierre) : ''}</div>` : ''}
       ${c.libros.length
-        ? '<ul class="list-group">' + c.libros.map((l) => itemContenidoHtml(l, true)).join('') + '</ul>'
+        ? barraSeleccionHtml() +
+          '<ul class="list-group">' + c.libros.map((l) => itemContenidoHtml(l, true)).join('') + '</ul>'
         : '<div class="text-muted small">La caja está vacía.</div>'}`;
   } catch (e) {
     if (manejarErrorSesion(e)) return;
@@ -405,6 +406,7 @@ async function consultarCaja(idCaja) {
 
 /** Panel admin: botón "sacar" en la caja consultada (también sirve para cajas cerradas). */
 async function onQuitarEnConsulta(evento) {
+  if (evento.target.closest('.btn-sacar-seleccion')) return sacarSeleccionEnConsulta();
   const boton = evento.target.closest('[data-quitar]');
   if (!boton || !app.cajaConsultada) return;
   const codigo = boton.dataset.quitar;
@@ -427,14 +429,38 @@ async function onQuitarEnConsulta(evento) {
   }
 }
 
+/** Panel admin: saca de una vez todos los libros marcados de la caja consultada. */
+async function sacarSeleccionEnConsulta() {
+  const contenedor = $('resultado-consulta-caja');
+  const idCaja = app.cajaConsultada;
+  const codigos = await confirmarSacarSeleccion(contenedor, idCaja);
+  if (!codigos) return;
+
+  mostrarCargando('Sacando libros…');
+  try {
+    const r = await llamarServidor('quitarLibros', app.sesion.token, idCaja, codigos);
+    ocultarCargando();
+    toast(`Se sacaron ${r.quitados} libro(s) de la caja ${idCaja}.`, 'success');
+    if (app.caja === idCaja) resincronizarCaja();
+    consultarCaja(idCaja);
+  } catch (e) {
+    ocultarCargando();
+    if (manejarErrorSesion(e)) return;
+    toast('No se pudieron sacar los libros: ' + e.message, 'danger');
+  }
+}
+
 /**
  * Fila de la lista de contenido de una caja: { codigo, titulo, editorial, veces }.
- * Con `quitable`, agrega un botón para sacar un ejemplar.
+ * Con `quitable`, agrega una casilla de selección y un botón para sacar un ejemplar.
  */
 function itemContenidoHtml(l, quitable) {
   const repetido = l.veces > 1;
   return `
     <li class="list-group-item d-flex justify-content-between align-items-center gap-2 ${repetido ? 'item-repetido' : ''}">
+      ${quitable ? `<input type="checkbox" class="form-check-input sel-libro flex-shrink-0 m-0"
+          data-codigo="${escaparHtml(l.codigo)}" data-veces="${l.veces}"
+          aria-label="Seleccionar ${escaparHtml(l.titulo || l.codigo)}">` : ''}
       <div class="text-truncate flex-grow-1">
         <div class="fw-semibold text-truncate">${escaparHtml(l.titulo || l.codigo)}</div>
         <div class="resultado-isbn text-truncate">
@@ -446,6 +472,81 @@ function itemContenidoHtml(l, quitable) {
           data-quitar="${escaparHtml(l.codigo)}" data-titulo="${escaparHtml(l.titulo || l.codigo)}"
           aria-label="Sacar un ejemplar de la caja" title="Sacar un ejemplar"><i class="bi bi-dash-lg"></i></button>` : ''}
     </li>`;
+}
+
+/* ----------------------------------------------------------------------------
+ *  SELECCIÓN MÚLTIPLE PARA VACIAR CAJAS
+ *  La barra va arriba de la lista; la lista (`.sel-libro`) y la barra viven
+ *  dentro del mismo contenedor, así sirve igual en la caja en curso y en la
+ *  consulta del panel admin.
+ * -------------------------------------------------------------------------- */
+
+function barraSeleccionHtml() {
+  return `
+    <div class="barra-seleccion d-flex align-items-center justify-content-between gap-2">
+      <label class="form-check d-flex align-items-center gap-2 m-0 py-1">
+        <input type="checkbox" class="form-check-input sel-todos m-0">
+        <span class="form-check-label small fw-semibold">Marcar todos</span>
+      </label>
+      <button type="button" class="btn btn-danger btn-sm btn-sacar-seleccion" disabled style="min-height:36px;">
+        <i class="bi bi-trash3"></i> Sacar <span class="sel-cuenta">0</span>
+      </button>
+    </div>`;
+}
+
+/** Códigos marcados dentro de `contenedor` y cuántos ejemplares suman. */
+function seleccionEn(contenedor) {
+  const marcadas = [...contenedor.querySelectorAll('.sel-libro:checked')];
+  return {
+    codigos: marcadas.map((c) => c.dataset.codigo),
+    ejemplares: marcadas.reduce((s, c) => s + Number(c.dataset.veces || 1), 0)
+  };
+}
+
+/** Sincroniza "Marcar todos" (incluido el estado intermedio) y el botón de sacar. */
+function actualizarBarraSeleccion(contenedor) {
+  const barra = contenedor.querySelector('.barra-seleccion');
+  if (!barra) return;
+  const casillas = contenedor.querySelectorAll('.sel-libro');
+  const { codigos, ejemplares } = seleccionEn(contenedor);
+  const todos = barra.querySelector('.sel-todos');
+  todos.checked = casillas.length > 0 && codigos.length === casillas.length;
+  todos.indeterminate = codigos.length > 0 && codigos.length < casillas.length;
+  todos.disabled = casillas.length === 0;
+  barra.querySelector('.sel-cuenta').textContent = ejemplares ? `${ejemplares} libro(s)` : '';
+  barra.querySelector('.btn-sacar-seleccion').disabled = codigos.length === 0;
+}
+
+/** Maneja los cambios de casillas dentro de `contenedor`. */
+function onCambioSeleccion(evento) {
+  const contenedor = evento.currentTarget;
+  if (evento.target.classList.contains('sel-todos')) {
+    contenedor.querySelectorAll('.sel-libro').forEach((c) => { c.checked = evento.target.checked; });
+  }
+  if (evento.target.matches('.sel-todos, .sel-libro')) actualizarBarraSeleccion(contenedor);
+}
+
+/** Tocar cualquier parte de la fila (salvo sus botones) marca o desmarca su casilla. */
+function onTocarFila(evento) {
+  if (evento.target.closest('button, input, label')) return;
+  const fila = evento.target.closest('.list-group-item');
+  const casilla = fila && fila.querySelector('.sel-libro');
+  if (!casilla) return;
+  casilla.checked = !casilla.checked;
+  casilla.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+/** Pide confirmación para sacar la selección. Devuelve los códigos, o null si se canceló. */
+async function confirmarSacarSeleccion(contenedor, idCaja) {
+  const { codigos, ejemplares } = seleccionEn(contenedor);
+  if (!codigos.length) return null;
+  const todos = codigos.length === contenedor.querySelectorAll('.sel-libro').length;
+  const ok = await confirmar(todos ? 'Vaciar caja' : 'Sacar libros',
+    `¿Sacar <b>${ejemplares} libro(s)</b> (${codigos.length} título(s), con todos sus ejemplares) ` +
+      `de la caja <b>${escaparHtml(idCaja)}</b>?` +
+      (todos ? '<div class="small text-body-secondary mt-2">La caja queda vacía.</div>' : ''),
+    todos ? 'Vaciar caja' : 'Sacar', 'btn-danger');
+  return ok ? codigos : null;
 }
 
 /** true si el valor registrado es un ISBN/ISSN (y no un título). */
@@ -1055,9 +1156,53 @@ function renderContenido() {
       (repetidos ? ` · <span class="text-warning-emphasis fw-semibold"><i class="bi bi-exclamation-triangle"></i> ${repetidos} repetido(s)</span>` : '')
     : '';
 
+  // Se conservan las casillas marcadas al volver a dibujar (p. ej. al escanear otro libro).
+  const marcados = new Set(seleccionEn(lista).codigos);
   lista.innerHTML = agrupado.length
     ? agrupado.map((l) => itemContenidoHtml(l, true)).join('')
     : '<li class="list-group-item text-muted small">La caja todavía está vacía.</li>';
+  lista.querySelectorAll('.sel-libro').forEach((c) => { c.checked = marcados.has(c.dataset.codigo); });
+
+  const barra = $('barra-contenido');
+  if (!barra.firstElementChild) barra.innerHTML = barraSeleccionHtml();
+  barra.classList.toggle('d-none', !agrupado.length);
+  actualizarBarraSeleccion($('tarjeta-contenido'));
+}
+
+/** Saca de una vez todos los libros marcados de la caja en curso. */
+async function sacarSeleccionDeCaja() {
+  if (!app.caja) return;
+  if (app.enviando) {
+    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    return;
+  }
+  const codigos = await confirmarSacarSeleccion($('tarjeta-contenido'), app.caja);
+  if (!codigos) return;
+
+  app.enviando = true;
+  setFeedback('proceso', 'Sacando libros de la caja…', `${codigos.length} título(s)`);
+  try {
+    const r = await llamarServidor('quitarLibros', app.sesion.token, app.caja, codigos);
+    const sacados = new Set(codigos);
+    app.contenido = app.contenido.filter((l) => !sacados.has(l.valor));
+    app.cantidad = r.cantidad;
+    actualizarContador();
+    renderContenido();
+    setFeedback('neutral', `Se sacaron ${r.quitados} libro(s) (${r.cantidad}/${app.limite})`,
+      r.cantidad ? 'Los demás libros siguen en la caja.' : 'La caja quedó vacía.');
+  } catch (e) {
+    if (manejarErrorSesion(e)) return;
+    destello('error');
+    if (e.codigo === 'CAJA_CERRADA') {
+      setFeedback('error', 'Caja cerrada', e.message);
+      setTimeout(mostrarMenu, 1800);
+      return;
+    }
+    setFeedback('error', 'No se pudieron sacar los libros', e.message);
+    resincronizarCaja();
+  } finally {
+    app.enviando = false;
+  }
 }
 
 /**
@@ -1925,6 +2070,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-volver-panel').addEventListener('click', irAlPanel);
   $('form-consulta-caja').addEventListener('submit', onConsultarCaja);
   $('resultado-consulta-caja').addEventListener('click', onQuitarEnConsulta);
+  $('resultado-consulta-caja').addEventListener('click', onTocarFila);
+  $('resultado-consulta-caja').addEventListener('change', onCambioSeleccion);
 
   // Menú operario
   $('btn-actualizar-cajas').addEventListener('click', cargarCajas);
@@ -1956,6 +2103,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('resultados-busqueda').addEventListener('click', onClickResultado);
   $('btn-cerrar-manual').addEventListener('click', onCerrarManual);
   $('contenido-caja').addEventListener('click', onClickContenido);
+  $('tarjeta-contenido').addEventListener('click', onTocarFila);
+  $('tarjeta-contenido').addEventListener('change', onCambioSeleccion);
+  $('barra-contenido').addEventListener('click', (e) => {
+    if (e.target.closest('.btn-sacar-seleccion')) sacarSeleccionDeCaja();
+  });
   $('btn-deshacer').addEventListener('click', () => sacarLibroDeCaja(app.deshacer, false));
   $('btn-volver-menu').addEventListener('click', onVolverMenu);
 

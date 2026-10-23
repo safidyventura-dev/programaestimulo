@@ -236,6 +236,9 @@
     #resultado-consulta-caja .list-group-item { font-size: .9rem; }
     #contenido-caja { max-height: 50vh; overflow-y: auto; }
     .btn-quitar { min-height: 40px; width: 40px; padding: 0; border-radius: 50%; }
+    /* Casillas grandes: se tocan con el dedo */
+    .sel-libro, .sel-todos { width: 1.4rem; height: 1.4rem; cursor: pointer; }
+    #resultado-consulta-caja .barra-seleccion { margin-bottom: .5rem; }
     .item-repetido { background: var(--bs-warning-bg-subtle) !important; border-left: 4px solid #fd7e14 !important; }
 
     /* ---------- Toasts ---------- */
@@ -553,11 +556,13 @@
       </div>
 
       <!-- Contenido completo de la caja (los repetidos se resaltan) -->
-      <div class="card tarjeta-contador mb-3">
+      <div class="card tarjeta-contador mb-3" id="tarjeta-contenido">
         <div class="card-header small d-flex justify-content-between align-items-center gap-2">
           <span class="fw-semibold"><i class="bi bi-list-check"></i> Contenido de la caja</span>
           <span class="text-body-secondary" id="contenido-resumen"></span>
         </div>
+        <!-- Selección múltiple para vaciar la caja (se completa desde app.js) -->
+        <div class="px-3 py-1 border-bottom d-none" id="barra-contenido"></div>
         <ul class="list-group list-group-flush" id="contenido-caja">
           <li class="list-group-item text-body-secondary small">La caja todavía está vacía.</li>
         </ul>
