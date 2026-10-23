@@ -508,6 +508,17 @@
         <div class="list-group mb-3" id="resultados-busqueda"></div>
       </div>
 
+      <!-- Estado del catálogo: se puede volver a bajar sin salir de la caja -->
+      <div class="d-flex align-items-center justify-content-center gap-2 small text-body-secondary mb-3">
+        <span><i class="bi bi-journal-bookmark"></i> Catálogo:
+          <span id="estado-catalogo-caja" class="fw-semibold">cargando…</span></span>
+        <button type="button" class="btn btn-outline-secondary btn-sm" id="btn-actualizar-catalogo"
+                style="min-height:36px;" aria-label="Actualizar el listado de libros">
+          <span class="spinner-border spinner-border-sm d-none" role="status"></span>
+          <i class="bi bi-arrow-clockwise"></i> Actualizar
+        </button>
+      </div>
+
       <!-- Feedback del último ingreso (justo debajo del visor) -->
       <div id="feedback-ingreso" class="feedback-neutral p-3 mb-3 d-flex align-items-center gap-2" aria-live="polite">
         <i class="bi bi-info-circle fs-4" id="feedback-icono"></i>

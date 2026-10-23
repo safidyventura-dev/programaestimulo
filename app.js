@@ -465,20 +465,42 @@ function etiquetaCodigo(codigo) {
  *  CATÁLOGO EN MEMORIA
  * ========================================================================== */
 
-/** Descarga el catálogo y construye los índices de búsqueda. */
-async function cargarCatalogo() {
-  if (app.catalogoCargando || app.catalogoListo || !app.sesion) return;
-  app.catalogoCargando = true;
+/**
+ * Muestra el estado del catálogo en el menú y en la pantalla de caja.
+ * @param {'cargando'|'ok'|'error'} tipo
+ */
+function estadoCatalogo(tipo, texto) {
+  const color = { cargando: 'text-warning', ok: 'text-success', error: 'text-danger' }[tipo];
+  ['estado-catalogo', 'estado-catalogo-caja'].forEach((id) => {
+    $(id).textContent = texto;
+    $(id).className = 'fw-semibold ' + color;
+  });
+  $('btn-reintentar-catalogo').classList.toggle('d-none', tipo !== 'error');
+  const btn = $('btn-actualizar-catalogo');
+  btn.disabled = tipo === 'cargando';
+  btn.querySelector('.spinner-border').classList.toggle('d-none', tipo !== 'cargando');
+  btn.querySelector('.bi').classList.toggle('d-none', tipo === 'cargando');
+}
 
-  $('estado-catalogo').textContent = 'cargando…';
-  $('estado-catalogo').className = 'fw-semibold text-warning';
-  $('btn-reintentar-catalogo').classList.add('d-none');
+/**
+ * Descarga el catálogo y construye los índices de búsqueda.
+ * Con `forzar` lo vuelve a bajar aunque ya esté cargado (p. ej. se agregaron
+ * títulos a la planilla); mientras tanto se sigue usando el catálogo anterior.
+ */
+async function cargarCatalogo(forzar = false) {
+  if (app.catalogoCargando || !app.sesion) return;
+  if (app.catalogoListo && forzar !== true) return;
+  app.catalogoCargando = true;
+  const cantidadAnterior = app.catalogo.length;
+
+  estadoCatalogo('cargando', app.catalogoListo ? 'actualizando…' : 'cargando…');
 
   try {
     const filas = await llamarServidor('getCatalogo', app.sesion.token);
 
     // La búsqueda manual es por título o editorial (el código se usa al escanear).
     // `isbn` guarda el código del catálogo, sea ISBN o ISSN.
+    const recargado = app.catalogoListo;
     app.catalogo = filas.map(([isbn, titulo, editorial]) => ({
       isbn: String(isbn || ''),
       titulo: String(titulo || ''),
@@ -498,16 +520,27 @@ async function cargarCatalogo() {
     });
 
     app.catalogoListo = true;
-    $('estado-catalogo').textContent = app.catalogo.length.toLocaleString('es-AR') + ' títulos listos';
-    $('estado-catalogo').className = 'fw-semibold text-success';
+    estadoCatalogo('ok', app.catalogo.length.toLocaleString('es-AR') + ' títulos listos');
     actualizarInfoBusqueda();
+    if ($('input-busqueda').value) onInputBusqueda(); // refresca resultados ya mostrados
     if (app.caja) renderContenido(); // completa títulos de registros viejos
+
+    if (recargado) {
+      const nuevos = app.catalogo.length - cantidadAnterior;
+      toast(nuevos > 0
+        ? `Catálogo actualizado: ${nuevos.toLocaleString('es-AR')} título(s) nuevo(s).`
+        : 'Catálogo actualizado.', 'success');
+    }
   } catch (e) {
     if (manejarErrorSesion(e)) return;
-    $('estado-catalogo').textContent = 'no se pudo cargar';
-    $('estado-catalogo').className = 'fw-semibold text-danger';
-    $('btn-reintentar-catalogo').classList.remove('d-none');
-    toast('No se pudo cargar el catálogo: ' + e.message, 'danger');
+    if (app.catalogoListo) {
+      // Falló la actualización: se sigue usando el catálogo que ya estaba.
+      estadoCatalogo('ok', app.catalogo.length.toLocaleString('es-AR') + ' títulos listos');
+      toast('No se pudo actualizar el catálogo: ' + e.message, 'danger');
+    } else {
+      estadoCatalogo('error', 'no se pudo cargar');
+      toast('No se pudo cargar el catálogo: ' + e.message, 'danger');
+    }
   } finally {
     app.catalogoCargando = false;
   }
@@ -1885,6 +1918,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (preferenciaTema() === 'auto') aplicarTema('auto');
   });
   $('btn-reintentar-catalogo').addEventListener('click', cargarCatalogo);
+  $('btn-actualizar-catalogo').addEventListener('click', () => cargarCatalogo(true));
 
   // Pantalla de caja
   document.querySelectorAll('input[name="modo"]').forEach((radio) => {
