@@ -235,6 +235,7 @@
     #contenido-caja .list-group-item,
     #resultado-consulta-caja .list-group-item { font-size: .9rem; }
     #contenido-caja { max-height: 50vh; overflow-y: auto; }
+    .btn-quitar { min-height: 40px; width: 40px; padding: 0; border-radius: 50%; }
     .item-repetido { background: var(--bs-warning-bg-subtle) !important; border-left: 4px solid #fd7e14 !important; }
 
     /* ---------- Toasts ---------- */
@@ -486,6 +487,10 @@
           <div class="fw-semibold" id="feedback-titulo">Listo para cargar libros</div>
           <div class="small" id="feedback-detalle">Escaneá el código o buscá por título / editorial.</div>
         </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0 d-none" id="btn-deshacer"
+                style="min-height:40px;" aria-label="Deshacer el último escaneo">
+          <i class="bi bi-arrow-counterclockwise"></i> Deshacer
+        </button>
       </div>
 
       <!-- Selector de modo -->

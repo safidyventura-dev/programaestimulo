@@ -368,17 +368,20 @@ function claseBadgeLimite(cantidad, limite) {
 }
 
 /** Panel admin → "Consultar caja": muestra el contenido de cualquier caja. */
-async function onConsultarCaja(evento) {
+function onConsultarCaja(evento) {
   evento.preventDefault();
   const idCaja = $('input-consulta-caja').value.trim();
-  const destino = $('resultado-consulta-caja');
-  if (!idCaja) return;
+  if (idCaja) consultarCaja(idCaja);
+}
 
+async function consultarCaja(idCaja) {
+  const destino = $('resultado-consulta-caja');
   const btn = $('btn-consultar-caja');
   btn.disabled = true;
   destino.innerHTML = '<div class="text-muted small py-2">Buscando…</div>';
   try {
     const c = await llamarServidor('getContenidoCaja', app.sesion.token, idCaja);
+    app.cajaConsultada = c.id;
     const repetidos = c.libros.filter((l) => l.veces > 1).length;
     destino.innerHTML = `
       <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
@@ -389,7 +392,7 @@ async function onConsultarCaja(evento) {
       </div>
       ${c.usuarioCierre ? `<div class="small text-muted mb-2">Cerrada por ${escaparHtml(c.usuarioCierre)}${c.fechaCierre ? ' · ' + escaparHtml(c.fechaCierre) : ''}</div>` : ''}
       ${c.libros.length
-        ? '<ul class="list-group">' + c.libros.map(itemContenidoHtml).join('') + '</ul>'
+        ? '<ul class="list-group">' + c.libros.map((l) => itemContenidoHtml(l, true)).join('') + '</ul>'
         : '<div class="text-muted small">La caja está vacía.</div>'}`;
   } catch (e) {
     if (manejarErrorSesion(e)) return;
@@ -399,18 +402,48 @@ async function onConsultarCaja(evento) {
   }
 }
 
-/** Fila de la lista de contenido de una caja: { codigo, titulo, editorial, veces }. */
-function itemContenidoHtml(l) {
+/** Panel admin: botón "sacar" en la caja consultada (también sirve para cajas cerradas). */
+async function onQuitarEnConsulta(evento) {
+  const boton = evento.target.closest('[data-quitar]');
+  if (!boton || !app.cajaConsultada) return;
+  const codigo = boton.dataset.quitar;
+  const titulo = boton.dataset.titulo || codigo;
+
+  const ok = await confirmar('Sacar libro',
+    `¿Sacar <b>1 ejemplar</b> de <b>${escaparHtml(titulo)}</b> de la caja <b>${escaparHtml(app.cajaConsultada)}</b>?`,
+    'Sacar', 'btn-danger');
+  if (!ok) return;
+
+  boton.disabled = true;
+  try {
+    await llamarServidor('quitarLibro', app.sesion.token, app.cajaConsultada, codigo);
+    toast('Se sacó "' + titulo + '" de la caja ' + app.cajaConsultada + '.', 'success');
+    consultarCaja(app.cajaConsultada);
+  } catch (e) {
+    boton.disabled = false;
+    if (manejarErrorSesion(e)) return;
+    toast('No se pudo sacar el libro: ' + e.message, 'danger');
+  }
+}
+
+/**
+ * Fila de la lista de contenido de una caja: { codigo, titulo, editorial, veces }.
+ * Con `quitable`, agrega un botón para sacar un ejemplar.
+ */
+function itemContenidoHtml(l, quitable) {
   const repetido = l.veces > 1;
   return `
     <li class="list-group-item d-flex justify-content-between align-items-center gap-2 ${repetido ? 'item-repetido' : ''}">
-      <div class="text-truncate">
+      <div class="text-truncate flex-grow-1">
         <div class="fw-semibold text-truncate">${escaparHtml(l.titulo || l.codigo)}</div>
         <div class="resultado-isbn text-truncate">
           ${l.editorial ? escaparHtml(l.editorial) + ' · ' : ''}${esCodigo(l.codigo) ? escaparHtml(etiquetaCodigo(l.codigo)) : 'Sin código'}
         </div>
       </div>
       ${repetido ? `<span class="badge text-bg-warning flex-shrink-0"><i class="bi bi-exclamation-triangle"></i> ×${l.veces}</span>` : ''}
+      ${quitable ? `<button type="button" class="btn btn-outline-danger btn-quitar flex-shrink-0"
+          data-quitar="${escaparHtml(l.codigo)}" data-titulo="${escaparHtml(l.titulo || l.codigo)}"
+          aria-label="Sacar un ejemplar de la caja" title="Sacar un ejemplar"><i class="bi bi-dash-lg"></i></button>` : ''}
     </li>`;
 }
 
@@ -830,7 +863,7 @@ async function mostrarCajaCerrada(idCaja) {
     await confirmar(
       'Caja ' + c.id + ' · cerrada',
       `<div class="small text-body-secondary mb-2">Cerrada por ${escaparHtml(c.usuarioCierre || '—')}${c.fechaCierre ? ' · ' + escaparHtml(c.fechaCierre) : ''} · ${c.cantidad} libro(s)</div>` +
-      (c.libros.length ? '<ul class="list-group">' + c.libros.map(itemContenidoHtml).join('') + '</ul>' : '<div class="text-body-secondary">Sin libros.</div>'),
+      (c.libros.length ? '<ul class="list-group">' + c.libros.map((l) => itemContenidoHtml(l, false)).join('') + '</ul>' : '<div class="text-body-secondary">Sin libros.</div>'),
       'Aceptar', 'btn-secondary'
     );
   } catch (e) {
@@ -911,8 +944,11 @@ function actualizarContador(animar = true) {
 /**
  * Actualiza el recuadro de feedback.
  * @param {'neutral'|'exito'|'error'|'proceso'|'alerta'} tipo
+ * @param {string=} deshacer  Valor del libro recién registrado: muestra el botón "Deshacer".
  */
-function setFeedback(tipo, titulo, detalle) {
+function setFeedback(tipo, titulo, detalle, deshacer) {
+  app.deshacer = deshacer || null;
+  $('btn-deshacer').classList.toggle('d-none', !deshacer);
   const iconos = {
     neutral: 'bi-info-circle',
     exito: 'bi-check-circle-fill',
@@ -986,8 +1022,65 @@ function renderContenido() {
     : '';
 
   lista.innerHTML = agrupado.length
-    ? agrupado.map(itemContenidoHtml).join('')
+    ? agrupado.map((l) => itemContenidoHtml(l, true)).join('')
     : '<li class="list-group-item text-muted small">La caja todavía está vacía.</li>';
+}
+
+/**
+ * Saca un ejemplar de un libro de la caja en curso.
+ * @param {string} valor               Código (o título) con el que se registró.
+ * @param {boolean} pedirConfirmacion  false para "Deshacer" (ya es una acción explícita).
+ */
+async function sacarLibroDeCaja(valor, pedirConfirmacion) {
+  if (!app.caja || !valor) return;
+  if (app.enviando) {
+    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    return;
+  }
+
+  const libro = app.contenido.slice().reverse().find((l) => l.valor === valor);
+  const descripcion = (libro && libro.titulo) || valor;
+
+  if (pedirConfirmacion) {
+    const veces = vecesEnCaja(valor);
+    const ok = await confirmar('Sacar libro',
+      `¿Sacar <b>1 ejemplar</b> de <b>${escaparHtml(descripcion)}</b> de la caja <b>${escaparHtml(app.caja)}</b>?` +
+      (veces > 1 ? `<div class="small text-body-secondary mt-2">Hay ${veces} ejemplares; quedarán ${veces - 1}.</div>` : ''),
+      'Sacar', 'btn-danger');
+    if (!ok) return;
+  }
+
+  app.enviando = true;
+  setFeedback('proceso', 'Sacando de la caja…', descripcion);
+  try {
+    const r = await llamarServidor('quitarLibro', app.sesion.token, app.caja, valor);
+
+    // Se quita el último ejemplar cargado (igual que en el servidor).
+    for (let i = app.contenido.length - 1; i >= 0; i--) {
+      if (app.contenido[i].valor === valor) { app.contenido.splice(i, 1); break; }
+    }
+    app.cantidad = r.cantidad;
+    actualizarContador();
+    renderContenido();
+    setFeedback('neutral', `Libro sacado de la caja (${r.cantidad}/${app.limite})`, descripcion);
+  } catch (e) {
+    if (manejarErrorSesion(e)) return;
+    destello('error');
+    if (e.codigo === 'CAJA_CERRADA') {
+      setFeedback('error', 'Caja cerrada', e.message);
+      setTimeout(mostrarMenu, 1800);
+      return;
+    }
+    setFeedback('error', 'No se pudo sacar el libro', e.message);
+    resincronizarCaja();
+  } finally {
+    app.enviando = false;
+  }
+}
+
+function onClickContenido(evento) {
+  const boton = evento.target.closest('[data-quitar]');
+  if (boton) sacarLibroDeCaja(boton.dataset.quitar, true);
 }
 
 /* ============================================================================
@@ -1066,13 +1159,13 @@ async function ingresarLibro(libro) {
 
     if (r.vecesEnCaja > 1) {
       destello('alerta');
-      setFeedback('alerta', `Registrado como repetido (×${r.vecesEnCaja}) · ${r.cantidad}/${app.limite}`, descripcion);
+      setFeedback('alerta', `Registrado como repetido (×${r.vecesEnCaja}) · ${r.cantidad}/${app.limite}`, descripcion, libro.valor);
     } else if (r.excedido) {
       destello('alerta');
-      setFeedback('alerta', `Registrado · supera el límite (${r.cantidad}/${app.limite})`, descripcion);
+      setFeedback('alerta', `Registrado · supera el límite (${r.cantidad}/${app.limite})`, descripcion, libro.valor);
     } else {
       destello('exito');
-      setFeedback('exito', `¡Registrado! (${r.cantidad}/${app.limite})`, descripcion);
+      setFeedback('exito', `¡Registrado! (${r.cantidad}/${app.limite})`, descripcion, libro.valor);
     }
 
     if (r.cantidad === app.limite) {
@@ -1345,7 +1438,8 @@ function estadoCamara(tipo, texto) {
 
 async function onLecturaCamara(texto) {
   const ahora = Date.now();
-  if (app.procesandoLectura) return;
+  // No se lee mientras hay otro proceso o un aviso abierto (p. ej. "¿Sacar libro?").
+  if (app.procesandoLectura || app.enviando || app.modalAbierto) return;
 
   // El mismo libro sigue frente a la cámara: no se repite.
   if (texto === app.ultimaLectura && ahora - app.ultimaLecturaTs < PAUSA_MISMO_CODIGO_MS) {
@@ -1529,6 +1623,7 @@ function confirmar(titulo, mensajeHtml, textoAceptar, claseBoton) {
     const el = $('modal-confirmar');
     const modal = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
     let respuesta = false;
+    app.modalAbierto = true;
 
     $('confirmar-titulo').textContent = titulo;
     $('confirmar-mensaje').innerHTML = mensajeHtml;
@@ -1542,6 +1637,7 @@ function confirmar(titulo, mensajeHtml, textoAceptar, claseBoton) {
       si.removeEventListener('click', onSi);
       $('confirmar-no').removeEventListener('click', onNo);
       el.removeEventListener('hidden.bs.modal', onCerrado);
+      app.modalAbierto = false;
       resolve(respuesta);
     };
 
@@ -1628,6 +1724,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btn-admin-empaquetar').addEventListener('click', irAlEmpaquetado);
   $('btn-volver-panel').addEventListener('click', irAlPanel);
   $('form-consulta-caja').addEventListener('submit', onConsultarCaja);
+  $('resultado-consulta-caja').addEventListener('click', onQuitarEnConsulta);
 
   // Menú operario
   $('btn-actualizar-cajas').addEventListener('click', cargarCajas);
@@ -1657,6 +1754,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('input-busqueda').addEventListener('keydown', onEnterBusqueda);
   $('resultados-busqueda').addEventListener('click', onClickResultado);
   $('btn-cerrar-manual').addEventListener('click', onCerrarManual);
+  $('contenido-caja').addEventListener('click', onClickContenido);
+  $('btn-deshacer').addEventListener('click', () => sacarLibroDeCaja(app.deshacer, false));
   $('btn-volver-menu').addEventListener('click', onVolverMenu);
 
   // Conexión
