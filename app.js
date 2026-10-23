@@ -62,7 +62,12 @@ const app = {
 
   caja: null,              // id de la caja en curso
   cantidad: 0,             // libros cargados en la caja en curso
-  enviando: false,         // hay un registro viajando al servidor
+  enviando: false,         // se está sacando un libro (o varios) de la caja
+  cola: [],                // lecturas sin guardar: [{ id, caja, valor, titulo, editorial }]
+  colaEnviando: null,      // Set de ids que están viajando al servidor ahora
+  colaTimer: null,         // reintento programado
+  colaReintentos: 0,
+  colaSinConexion: false,  // el último intento falló por red
   contenido: [],           // libros de la caja en curso: [{ valor, titulo, editorial, origen, hora }]
 
   lectorFoto: null,        // instancia Html5Qrcode usada para leer fotos
@@ -220,6 +225,7 @@ function iniciarSesion(sesion) {
   app.sesion = { token: sesion.token, usuario: sesion.usuario, rol: sesion.rol };
   if (sesion.maxLibros) app.limite = sesion.maxLibros;
   guardarSesionLocal(app.sesion);
+  cargarColaLocal();
 
   $('barra-usuario').textContent = sesion.usuario + ' · ' + sesion.rol;
 
@@ -253,6 +259,14 @@ async function onLogout() {
     : true;
   if (!ok) return;
 
+  if (!(await esperarCola('Guardando', null))) {
+    const salir = await confirmar('Libros sin guardar',
+      `Hay <b>${app.cola.length} libro(s)</b> sin guardar por falta de conexión.<br><br>` +
+        'Si salís, quedan en este celular y se guardan la próxima vez que entres con tu usuario.',
+      'Salir igual', 'btn-danger', 'Quedarme');
+    if (!salir) return;
+  }
+
   const token = app.sesion && app.sesion.token;
   cerrarSesionLocal();
   if (token) llamarServidor('logout', token).catch(() => {}); // no bloqueante
@@ -268,6 +282,12 @@ function cerrarSesionLocal() {
   app.caja = null;
   app.cantidad = 0;
   app.contenido = [];
+  // La cola queda en el almacenamiento del celular para el próximo ingreso.
+  clearTimeout(app.colaTimer);
+  app.cola = [];
+  app.colaEnviando = null;
+  app.colaSinConexion = false;
+  app.colaReintentos = 0;
   app.catalogo = [];
   app.indiceIsbn = new Map();
   app.catalogoListo = false;
@@ -467,6 +487,8 @@ function itemContenidoHtml(l, quitable) {
           ${l.editorial ? escaparHtml(l.editorial) + ' · ' : ''}${esCodigo(l.codigo) ? escaparHtml(etiquetaCodigo(l.codigo)) : 'Sin código'}
         </div>
       </div>
+      ${l.pendientes ? `<span class="text-warning-emphasis flex-shrink-0" title="Guardando…" aria-label="Guardando">
+          <span class="spinner-border spinner-border-sm"></span></span>` : ''}
       ${repetido ? `<span class="badge text-bg-warning flex-shrink-0"><i class="bi bi-exclamation-triangle"></i> ×${l.veces}</span>` : ''}
       ${quitable ? `<button type="button" class="btn btn-outline-danger btn-quitar flex-shrink-0"
           data-quitar="${escaparHtml(l.codigo)}" data-titulo="${escaparHtml(l.titulo || l.codigo)}"
@@ -1010,15 +1032,14 @@ async function mostrarCajaCerrada(idCaja) {
 
 /** Abre la caja elegida y pasa a la pantalla de carga de libros. */
 async function abrirCajaSeleccionada(idCaja) {
+  // Si quedaron libros de esta caja sin guardar, se intenta guardarlos antes de leerla.
+  await esperarCola('Guardando', idCaja);
   mostrarCargando('Abriendo caja ' + idCaja + '…');
   try {
     const info = await llamarServidor('abrirCaja', app.sesion.token, idCaja);
     app.caja = info.id;
-    app.cantidad = info.cantidad;
+    aplicarContenidoServidor(info);
     app.limite = info.max || app.limite;
-    app.contenido = (info.contenido || []).map((l) => completarDesdeCatalogo({
-      valor: l.codigo, titulo: l.titulo, editorial: l.editorial, origen: 'previo', hora: ''
-    }));
 
     $('caja-id').textContent = info.id;
     $('contador-max').textContent = app.limite;
@@ -1026,6 +1047,7 @@ async function abrirCajaSeleccionada(idCaja) {
     $('resultados-busqueda').innerHTML = '';
     actualizarContador(false);
     renderContenido();
+    actualizarEstadoCola();
     actualizarInfoBusqueda();
     setFeedback('neutral', 'Listo para cargar libros',
       info.cantidad ? `La caja ya tenía ${info.cantidad} libro(s). Continuá cargando.` : 'Escaneá el código o buscá por título / editorial.');
@@ -1145,9 +1167,11 @@ function renderContenido() {
   app.contenido.slice().reverse().forEach((l) => {
     if (!indice.has(l.valor)) {
       indice.set(l.valor, agrupado.length);
-      agrupado.push({ codigo: l.valor, titulo: l.titulo, editorial: l.editorial, veces: 0 });
+      agrupado.push({ codigo: l.valor, titulo: l.titulo, editorial: l.editorial, veces: 0, pendientes: 0 });
     }
-    agrupado[indice.get(l.valor)].veces++;
+    const g = agrupado[indice.get(l.valor)];
+    g.veces++;
+    if (l.pendiente) g.pendientes++;
   });
 
   const repetidos = agrupado.filter((l) => l.veces > 1).length;
@@ -1173,11 +1197,12 @@ function renderContenido() {
 async function sacarSeleccionDeCaja() {
   if (!app.caja) return;
   if (app.enviando) {
-    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    toast('Esperá a que termine de sacarse el libro de la caja.', 'warning');
     return;
   }
   const codigos = await confirmarSacarSeleccion($('tarjeta-contenido'), app.caja);
   if (!codigos) return;
+  if (!(await esperarCola())) return; // primero se guarda lo pendiente
 
   app.enviando = true;
   setFeedback('proceso', 'Sacando libros de la caja…', `${codigos.length} título(s)`);
@@ -1213,7 +1238,7 @@ async function sacarSeleccionDeCaja() {
 async function sacarLibroDeCaja(valor, pedirConfirmacion) {
   if (!app.caja || !valor) return;
   if (app.enviando) {
-    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    toast('Esperá a que termine de sacarse el libro de la caja.', 'warning');
     return;
   }
 
@@ -1228,6 +1253,7 @@ async function sacarLibroDeCaja(valor, pedirConfirmacion) {
       'Sacar', 'btn-danger');
     if (!ok) return;
   }
+  if (!(await esperarCola())) return; // primero se guarda lo pendiente
 
   app.enviando = true;
   setFeedback('proceso', 'Sacando de la caja…', descripcion);
@@ -1257,6 +1283,30 @@ async function sacarLibroDeCaja(valor, pedirConfirmacion) {
   }
 }
 
+/**
+ * "Deshacer" del último libro anotado. Si todavía no salió del celular se
+ * borra de la cola sin ir al servidor; si ya se guardó (o está viajando), se saca.
+ */
+async function deshacerLectura(id) {
+  if (!app.caja || !id) return;
+  const libro = app.contenido.find((l) => l.id === id);
+  if (!libro) return;
+
+  const enCola = app.cola.some((l) => l.id === id);
+  const viajando = app.colaEnviando && app.colaEnviando.has(id);
+  if (enCola && !viajando) {
+    quitarDeCola(new Set([id]));
+    app.contenido = app.contenido.filter((l) => l.id !== id);
+    app.cantidad--;
+    actualizarContador();
+    renderContenido();
+    actualizarEstadoCola();
+    setFeedback('neutral', `Libro sacado de la caja (${app.cantidad}/${app.limite})`, libro.titulo || libro.valor);
+    return;
+  }
+  await sacarLibroDeCaja(libro.valor, false);
+}
+
 function onClickContenido(evento) {
   const boton = evento.target.closest('[data-quitar]');
   if (boton) sacarLibroDeCaja(boton.dataset.quitar, true);
@@ -1267,17 +1317,17 @@ function onClickContenido(evento) {
  * ========================================================================== */
 
 /**
- * Envía un libro al servidor. Es el punto común para escáner, código tipeado y
+ * Anota un libro en la caja en curso y lo deja en la cola de guardado. Es el punto común para escáner, código tipeado y
  * búsqueda por título. Antes de enviar avisa si el libro ya está en la caja o
  * si se supera el límite sugerido, y pide confirmación.
  * @param {{valor:string, titulo?:string, editorial?:string, origen:string}} libro
- * @return {Promise<boolean>} true si se registró.
+ * @return {Promise<boolean>} true si se anotó.
  */
 async function ingresarLibro(libro) {
   if (!app.caja) return false;
 
   if (app.enviando) {
-    setFeedback('proceso', 'Esperá un momento…', 'Se está guardando el libro anterior.');
+    setFeedback('proceso', 'Esperá un momento…', 'Se están sacando libros de la caja.');
     return false;
   }
 
@@ -1315,62 +1365,243 @@ async function ingresarLibro(libro) {
     }
   }
 
-  app.enviando = true;
-  setFeedback('proceso', 'Guardando…', descripcion);
+  // 3) Se anota en el celular al instante y se guarda en segundo plano (cola).
+  const lectura = {
+    id: nuevoIdLectura(),
+    caja: app.caja,
+    valor: libro.valor,
+    titulo: libro.titulo || '',
+    editorial: libro.editorial || ''
+  };
+  app.contenido.push({
+    id: lectura.id,
+    pendiente: true,
+    valor: libro.valor,
+    titulo: libro.titulo,
+    editorial: libro.editorial,
+    origen: libro.origen,
+    hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
+  });
+  app.cantidad++;
+  encolarLectura(lectura);
+
+  actualizarContador();
+  renderContenido();
+
+  const vecesAhora = veces + 1;
+  if (vecesAhora > 1) {
+    destello('alerta');
+    setFeedback('alerta', `Anotado como repetido (×${vecesAhora}) · ${app.cantidad}/${app.limite}`, descripcion, lectura.id);
+  } else if (app.cantidad > app.limite) {
+    destello('alerta');
+    setFeedback('alerta', `Anotado · supera el límite (${app.cantidad}/${app.limite})`, descripcion, lectura.id);
+  } else {
+    destello('exito');
+    setFeedback('exito', `¡Anotado! (${app.cantidad}/${app.limite})`, descripcion, lectura.id);
+  }
+
+  // Sin await: el modal queda abierto (y la cámara sin leer) hasta que el operario elija.
+  if (app.cantidad === app.limite) sugerirCerrarCaja();
+  return true;
+}
+
+/* ============================================================================
+ *  COLA DE GUARDADO
+ *  Los libros se anotan en el celular al instante y se mandan al servidor en
+ *  segundo plano, en orden y en lotes. La cola también se guarda en el
+ *  almacenamiento del celular para no perder nada si se cierra la página.
+ *  Cada lectura lleva un id único: si un envío se reintenta (timeout, red) el
+ *  servidor no la vuelve a escribir.
+ * ========================================================================== */
+
+/** Máximo de libros por envío. */
+const LOTE_COLA = 25;
+/** Espera entre reintentos cuando falla la red (ms): 2 s, 5 s, 10 s, 20 s y luego 30 s. */
+const ESPERAS_REINTENTO_MS = [2000, 5000, 10000, 20000, 30000];
+
+function nuevoIdLectura() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function claveCola() {
+  return 'pe_cola_' + ((app.sesion && app.sesion.usuario) || '');
+}
+
+function guardarColaLocal() {
+  try {
+    if (app.cola.length) localStorage.setItem(claveCola(), JSON.stringify(app.cola));
+    else localStorage.removeItem(claveCola());
+  } catch (e) { /* sin almacenamiento: la cola vive solo en memoria */ }
+}
+
+/** Al iniciar sesión: recupera libros que quedaron sin guardar (p. ej. se cerró la página). */
+function cargarColaLocal() {
+  try { app.cola = JSON.parse(localStorage.getItem(claveCola()) || '[]') || []; } catch (e) { app.cola = []; }
+  if (app.cola.length) {
+    toast(`Hay ${app.cola.length} libro(s) de una sesión anterior sin guardar. Guardándolos…`, 'info');
+    procesarCola();
+  }
+  actualizarEstadoCola();
+}
+
+function encolarLectura(lectura) {
+  app.cola.push(lectura);
+  guardarColaLocal();
+  procesarCola();
+}
+
+/** Pendientes de una caja, o de todas con `null` (incluye los que están viajando). */
+function pendientesDeCaja(idCaja) {
+  return idCaja ? app.cola.filter((l) => l.caja === idCaja).length : app.cola.length;
+}
+
+/** Manda el próximo lote. Se llama sola mientras quede algo en la cola. */
+async function procesarCola() {
+  if (app.colaEnviando || !app.cola.length || !app.sesion) {
+    actualizarEstadoCola();
+    return;
+  }
+  clearTimeout(app.colaTimer);
+  app.colaTimer = null;
+
+  // Un lote es siempre de una sola caja (la primera de la cola).
+  const caja = app.cola[0].caja;
+  const lote = app.cola.filter((l) => l.caja === caja).slice(0, LOTE_COLA);
+  app.colaEnviando = new Set(lote.map((l) => l.id));
+  actualizarEstadoCola();
 
   try {
-    const r = await llamarServidor('registrarLibro', app.sesion.token, app.caja,
-      libro.valor, libro.titulo || '', libro.editorial || '');
+    const r = await llamarServidor('registrarLibros', app.sesion.token, caja,
+      lote.map(({ id, valor, titulo, editorial }) => ({ id, valor, titulo, editorial })));
 
-    app.cantidad = r.cantidad;
-    app.limite = r.max || app.limite;
-    $('contador-max').textContent = app.limite;
-    app.contenido.push({
-      valor: libro.valor,
-      titulo: libro.titulo,
-      editorial: libro.editorial,
-      origen: libro.origen,
-      hora: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })
-    });
+    quitarDeCola(app.colaEnviando);
+    app.colaReintentos = 0;
+    app.colaSinConexion = false;
 
-    actualizarContador();
-    renderContenido();
-
-    if (r.vecesEnCaja > 1) {
-      destello('alerta');
-      setFeedback('alerta', `Registrado como repetido (×${r.vecesEnCaja}) · ${r.cantidad}/${app.limite}`, descripcion, libro.valor);
-    } else if (r.excedido) {
-      destello('alerta');
-      setFeedback('alerta', `Registrado · supera el límite (${r.cantidad}/${app.limite})`, descripcion, libro.valor);
-    } else {
-      destello('exito');
-      setFeedback('exito', `¡Registrado! (${r.cantidad}/${app.limite})`, descripcion, libro.valor);
+    if (app.caja === caja) {
+      app.contenido.forEach((l) => { if (l.id && !app.cola.some((c) => c.id === l.id)) l.pendiente = false; });
+      // El servidor manda la cantidad real guardada; se suman los que siguen en la cola.
+      app.cantidad = r.cantidad + pendientesDeCaja(caja);
+      app.limite = r.max || app.limite;
+      $('contador-max').textContent = app.limite;
+      actualizarContador(false);
+      renderContenido();
     }
-
-    // Sin await: el modal queda abierto (y la cámara sin leer) hasta que el operario elija,
-    // pero este registro termina ya y libera `app.enviando` para poder cerrar la caja.
-    if (r.cantidad === app.limite) sugerirCerrarCaja();
-    return true;
   } catch (e) {
-    if (manejarErrorSesion(e)) return false;
-    destello('error');
+    const enviados = app.colaEnviando;
+    app.colaEnviando = null;
+    if (manejarErrorSesion(e)) return; // la cola queda guardada para el próximo ingreso
 
-    if (e.codigo === 'CAJA_CERRADA') {
-      setFeedback('error', 'Caja cerrada', e.message);
-      toast(e.message, 'warning');
-      setTimeout(mostrarMenu, 1800);
-      return false;
+    if (e.codigo === 'CAJA_CERRADA' || (e.codigo === 'SERVIDOR' && !/ocupado/i.test(e.message))) {
+      // No se va a poder guardar reintentando: se avisa qué libros hay que volver a cargar.
+      descartarLecturas(caja, enviados, e);
+      return;
     }
 
-    setFeedback('error', 'No se registró el libro', e.message + ' Volvé a intentarlo.');
-
-    // Si fue un problema de red/timeout, el registro pudo haberse guardado igual:
-    // se resincroniza el contador con el servidor.
-    if (e.codigo === 'TIMEOUT' || e.codigo === 'RED') resincronizarCaja();
-    return false;
+    // Red, timeout o servidor ocupado: se reintenta solo (el id evita duplicados).
+    app.colaSinConexion = true;
+    const espera = ESPERAS_REINTENTO_MS[Math.min(app.colaReintentos, ESPERAS_REINTENTO_MS.length - 1)];
+    app.colaReintentos++;
+    app.colaTimer = setTimeout(procesarCola, espera);
+    actualizarEstadoCola();
+    return;
   } finally {
-    app.enviando = false;
+    if (app.colaEnviando) app.colaEnviando = null;
   }
+
+  if (app.cola.length) procesarCola();
+  else actualizarEstadoCola();
+}
+
+function quitarDeCola(ids) {
+  app.cola = app.cola.filter((l) => !ids.has(l.id));
+  guardarColaLocal();
+}
+
+/** Libros que el servidor rechazó: se sacan de la caja en pantalla y se avisa cuáles eran. */
+function descartarLecturas(caja, ids, error) {
+  const descartados = app.cola.filter((l) => ids.has(l.id));
+  quitarDeCola(ids);
+
+  if (app.caja === caja) {
+    app.contenido = app.contenido.filter((l) => !ids.has(l.id));
+    app.cantidad = Math.max(0, app.cantidad - descartados.length);
+    actualizarContador(false);
+    renderContenido();
+  }
+  actualizarEstadoCola();
+
+  destello('error');
+  const lista = '<ul class="mb-0">' + descartados.map((l) => `<li>${escaparHtml(l.titulo || l.valor)}</li>`).join('') + '</ul>';
+  const cerrada = error.codigo === 'CAJA_CERRADA';
+  confirmar('Libros sin guardar',
+    `<div class="alert alert-danger py-2"><i class="bi bi-x-octagon-fill"></i> ${escaparHtml(error.message)}</div>` +
+      `Estos ${descartados.length} libro(s) <b>no se guardaron</b> en la caja <b>${escaparHtml(caja)}</b>:${lista}` +
+      (cerrada ? '<div class="mt-2">Cargalos en otra caja.</div>' : '<div class="mt-2">Volvé a escanearlos.</div>'),
+    'Entendido', 'btn-primary', 'Cerrar'
+  ).then(() => { if (cerrada && app.caja === caja) mostrarMenu(); });
+}
+
+/**
+ * Espera a que se guarde todo lo pendiente de la caja en curso, mostrando el
+ * progreso. Devuelve false si no se pudo (sin conexión), para no seguir.
+ */
+async function esperarCola(texto, caja = app.caja) {
+  if (!pendientesDeCaja(caja)) return true;
+
+  mostrarCargando((texto || 'Guardando') + ` ${pendientesDeCaja(caja)} libro(s) pendientes…`);
+  try {
+    let intentado = false;
+    while (pendientesDeCaja(caja) && app.sesion) {
+      if (!app.colaEnviando) {
+        if (intentado && app.colaSinConexion) break; // falló un intento: no se bloquea al operario
+        procesarCola(); // sin esperar el reintento programado
+        intentado = true;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  } finally {
+    ocultarCargando();
+  }
+
+  const quedan = pendientesDeCaja(caja);
+  if (quedan) {
+    toast(`Todavía hay ${quedan} libro(s) sin guardar. Revisá la conexión; se siguen reintentando solos.`, 'warning');
+    return false;
+  }
+  return true;
+}
+
+/** Indicador "Todo guardado / Guardando N… / Sin conexión" en la pantalla de caja. */
+function actualizarEstadoCola() {
+  const el = $('estado-guardado');
+  if (!el) return;
+  const n = app.caja ? pendientesDeCaja(app.caja) : app.cola.length;
+  if (!n) {
+    el.className = 'small text-success';
+    el.innerHTML = '<i class="bi bi-cloud-check"></i> Todo guardado';
+  } else if (app.colaSinConexion && !app.colaEnviando) {
+    el.className = 'small text-danger fw-semibold';
+    el.innerHTML = `<i class="bi bi-wifi-off"></i> ${n} sin guardar · reintentando…`;
+  } else {
+    el.className = 'small text-warning-emphasis fw-semibold';
+    el.innerHTML = `<span class="spinner-border spinner-border-sm"></span> Guardando ${n}…`;
+  }
+}
+
+/**
+ * Arma el contenido de la caja en curso con lo que devolvió el servidor más
+ * los libros de la cola que todavía no se guardaron.
+ */
+function aplicarContenidoServidor(info) {
+  const enCola = app.cola.filter((l) => l.caja === app.caja);
+  app.contenido = (info.contenido || []).map((l) => completarDesdeCatalogo({
+    valor: l.codigo, titulo: l.titulo, editorial: l.editorial, origen: 'previo', hora: ''
+  })).concat(enCola.map((l) => ({
+    id: l.id, pendiente: true, valor: l.valor, titulo: l.titulo, editorial: l.editorial, origen: 'cola', hora: ''
+  })));
+  app.cantidad = info.cantidad + enCola.length;
 }
 
 /** Vuelve a leer la cantidad real de libros de la caja desde el servidor. */
@@ -1378,14 +1609,12 @@ async function resincronizarCaja() {
   if (!app.caja) return;
   try {
     const info = await llamarServidor('abrirCaja', app.sesion.token, app.caja);
-    if (info.cantidad !== app.cantidad) {
-      app.cantidad = info.cantidad;
-      app.contenido = (info.contenido || []).map((l) => ({
-        valor: l.codigo, titulo: l.titulo, editorial: l.editorial, origen: 'previo', hora: ''
-      }));
-      actualizarContador();
-      renderContenido();
-      toast('Contador actualizado desde el servidor: ' + info.cantidad + ' libro(s).', 'info');
+    const antes = app.cantidad;
+    aplicarContenidoServidor(info);
+    actualizarContador(false);
+    renderContenido();
+    if (app.cantidad !== antes) {
+      toast('Contador actualizado desde el servidor: ' + app.cantidad + ' libro(s).', 'info');
     }
   } catch (e) {
     if (manejarErrorSesion(e)) return;
@@ -1479,7 +1708,7 @@ async function finalizarCaja() {
 async function onCerrarManual() {
   if (!app.caja) return;
   if (app.enviando || app.leyendoFoto) {
-    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    toast('Esperá a que termine de sacarse el libro de la caja.', 'warning');
     return;
   }
   if (app.cantidad === 0) {
@@ -1524,6 +1753,7 @@ async function sugerirCerrarCaja() {
 
 async function cerrarCajaActual() {
   if (!app.caja) return;
+  if (!(await esperarCola('Antes de cerrar: guardando'))) return;
   mostrarCargando('Cerrando caja…');
   try {
     const r = await llamarServidor('cerrarCaja', app.sesion.token, app.caja);
@@ -1540,7 +1770,7 @@ async function cerrarCajaActual() {
 
 async function onVolverMenu() {
   if (app.enviando || app.leyendoFoto) {
-    toast('Esperá a que termine de guardarse el último libro.', 'warning');
+    toast('Esperá a que termine de sacarse el libro de la caja.', 'warning');
     return;
   }
   const ok = app.cantidad > 0
@@ -1548,7 +1778,10 @@ async function onVolverMenu() {
         `La caja <b>${escaparHtml(app.caja)}</b> quedará <b>disponible</b> con ${app.cantidad} libro(s). Podés retomarla después.`,
         'Volver', 'btn-primary')
     : true;
-  if (ok) mostrarMenu();
+  if (!ok) return;
+  // Se intenta guardar lo pendiente; si no hay conexión se sigue reintentando desde el menú.
+  await esperarCola();
+  mostrarMenu();
 }
 
 /* ============================================================================
@@ -2108,13 +2341,24 @@ document.addEventListener('DOMContentLoaded', () => {
   $('barra-contenido').addEventListener('click', (e) => {
     if (e.target.closest('.btn-sacar-seleccion')) sacarSeleccionDeCaja();
   });
-  $('btn-deshacer').addEventListener('click', () => sacarLibroDeCaja(app.deshacer, false));
+  $('btn-deshacer').addEventListener('click', () => deshacerLectura(app.deshacer));
   $('btn-volver-menu').addEventListener('click', onVolverMenu);
 
   // Conexión
-  window.addEventListener('online', () => { actualizarEstadoConexion(); toast('Conexión restablecida.', 'success'); });
+  window.addEventListener('online', () => {
+    actualizarEstadoConexion();
+    toast('Conexión restablecida.', 'success');
+    procesarCola(); // sin esperar el próximo reintento
+  });
   window.addEventListener('offline', actualizarEstadoConexion);
   actualizarEstadoConexion();
+
+  // Aviso del navegador si se intenta cerrar o recargar con libros sin guardar.
+  window.addEventListener('beforeunload', (e) => {
+    if (!app.cola.length) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 
   // Desbloquea el audio en el primer toque (requisito de los navegadores móviles).
   document.addEventListener('touchstart', () => beep(1, 0.001), { once: true, passive: true });
