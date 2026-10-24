@@ -1802,10 +1802,13 @@ async function finalizarCaja(pendiente = false) {
   vibrar([100, 50, 100, 50, 200]);
 
   app.caja = null;
+  const desdeEdicion = app.edicion; // Admin: se vuelve al panel con la caja consultada
 
   setTimeout(() => {
     $('overlay-completada').classList.remove('visible');
-    if (app.sesion) mostrarMenu();
+    if (!app.sesion) return;
+    if (desdeEdicion) salirDeEdicion(idCaja);
+    else mostrarMenu();
   }, 2500);
 }
 
@@ -1927,17 +1930,26 @@ function aplicarModoEdicion(estado) {
       ? 'La caja está cerrada y sigue cerrada: los cambios se guardan igual.'
       : 'La caja está abierta: los operarios también pueden seguir cargándola.';
   }
-  $('btn-cerrar-manual').classList.toggle('d-none', edicion);
+  // Una caja abierta se puede cerrar también desde la edición; una cerrada, no hace falta.
+  const cerrada = edicion && estado === 'Cerrada';
+  $('btn-cerrar-manual').classList.toggle('d-none', cerrada);
   $('btn-volver-menu').innerHTML = edicion
-    ? '<i class="bi bi-check2-circle"></i> Terminar edición y volver al panel'
+    ? '<i class="bi bi-check2-circle"></i> Terminar edición y volver al panel' +
+      (cerrada ? '' : ' (la caja queda abierta)')
     : '<i class="bi bi-arrow-left"></i> Volver al menú (la caja queda abierta)';
-  $('btn-volver-menu').className = edicion ? 'btn btn-primary btn-lg' : 'btn btn-link text-secondary';
+  $('btn-volver-menu').className = !edicion ? 'btn btn-link text-secondary'
+    : cerrada ? 'btn btn-primary btn-lg' : 'btn btn-outline-primary';
 }
 
 async function terminarEdicion() {
   const idCaja = app.caja;
   if (!(await esperarCola())) return; // sin conexión: se queda editando hasta que se guarde
+  salirDeEdicion(idCaja);
+  toast('Edición de la caja ' + idCaja + ' terminada.', 'success');
+}
 
+/** Vuelve al panel admin mostrando la caja que se estaba editando. */
+function salirDeEdicion(idCaja) {
   detenerCamara();
   app.caja = null;
   app.cantidad = 0;
@@ -1948,7 +1960,6 @@ async function terminarEdicion() {
   irAlPanel();
   $('input-consulta-caja').value = idCaja;
   consultarCaja(idCaja);
-  toast('Edición de la caja ' + idCaja + ' terminada.', 'success');
 }
 
 /* ============================================================================
