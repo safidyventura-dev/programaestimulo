@@ -64,6 +64,7 @@ const app = {
   cantidad: 0,             // libros cargados en la caja en curso
   enviando: false,         // se está sacando un libro (o varios) de la caja
   cola: [],                // lecturas sin guardar: [{ id, caja, valor, titulo, editorial }]
+  cierres: [],             // ids de cajas que se cerraron sin conexión (se cierran al volver)
   colaEnviando: null,      // Set de ids que están viajando al servidor ahora
   colaTimer: null,         // reintento programado
   colaReintentos: 0,
@@ -260,10 +261,14 @@ async function onLogout() {
     : true;
   if (!ok) return;
 
-  if (!(await esperarCola('Guardando', null))) {
-    const salir = await confirmar('Libros sin guardar',
-      `Hay <b>${app.cola.length} libro(s)</b> sin guardar por falta de conexión.<br><br>` +
-        'Si salís, quedan en este celular y se guardan la próxima vez que entres con tu usuario.',
+  await esperarCola('Guardando', null);
+  if (app.cola.length || app.cierres.length) {
+    const partes = [];
+    if (app.cola.length) partes.push(`<b>${app.cola.length} libro(s)</b> sin guardar`);
+    if (app.cierres.length) partes.push(`<b>${app.cierres.length} caja(s)</b> sin cerrar`);
+    const salir = await confirmar('Cambios sin enviar',
+      `Hay ${partes.join(' y ')} por falta de conexión.<br><br>` +
+        'Si salís, quedan en este celular y se envían la próxima vez que entres con tu usuario.',
       'Salir igual', 'btn-danger', 'Quedarme');
     if (!salir) return;
   }
@@ -286,6 +291,7 @@ function cerrarSesionLocal() {
   // La cola queda en el almacenamiento del celular para el próximo ingreso.
   clearTimeout(app.colaTimer);
   app.cola = [];
+  app.cierres = [];
   app.colaEnviando = null;
   app.colaSinConexion = false;
   app.colaReintentos = 0;
@@ -976,6 +982,9 @@ function renderCajas() {
 }
 
 function badgeEstadoCaja(c) {
+  if (!c.cerrada && app.cierres.includes(c.id)) {
+    return `<span class="badge text-bg-warning"><i class="bi bi-wifi-off"></i> Cerrando… · ${c.cantidad + pendientesDeCaja(c.id)}</span>`;
+  }
   if (c.cerrada) {
     return `<span class="badge text-bg-secondary"><i class="bi bi-lock-fill"></i> Cerrada · ${c.cantidad}</span>`;
   }
@@ -997,6 +1006,10 @@ async function onClickCaja(evento) {
     await mostrarCajaCerrada(caja.id);
     return;
   }
+  if (app.cierres.includes(caja.id)) {
+    toast(`La caja ${caja.id} ya se cerró en este celular; se termina de cerrar cuando vuelva la conexión.`, 'info');
+    return;
+  }
   abrirCajaSeleccionada(caja.id);
 }
 
@@ -1013,7 +1026,9 @@ function onEnterBuscarCaja(evento) {
     return;
   }
   if (elegida.cerrada) mostrarCajaCerrada(elegida.id);
-  else abrirCajaSeleccionada(elegida.id);
+  else if (app.cierres.includes(elegida.id)) {
+    toast(`La caja ${elegida.id} ya se cerró en este celular; se termina de cerrar cuando vuelva la conexión.`, 'info');
+  } else abrirCajaSeleccionada(elegida.id);
 }
 
 /** Modal con el contenido de una caja cerrada. */
@@ -1444,19 +1459,45 @@ function claveCola() {
 
 function guardarColaLocal() {
   try {
-    if (app.cola.length) localStorage.setItem(claveCola(), JSON.stringify(app.cola));
-    else localStorage.removeItem(claveCola());
+    if (app.cola.length || app.cierres.length) {
+      localStorage.setItem(claveCola(), JSON.stringify({ lecturas: app.cola, cierres: app.cierres }));
+    } else {
+      localStorage.removeItem(claveCola());
+    }
   } catch (e) { /* sin almacenamiento: la cola vive solo en memoria */ }
 }
 
-/** Al iniciar sesión: recupera libros que quedaron sin guardar (p. ej. se cerró la página). */
+/** Al iniciar sesión: recupera libros y cierres que quedaron sin enviar (p. ej. se cerró la página). */
 function cargarColaLocal() {
-  try { app.cola = JSON.parse(localStorage.getItem(claveCola()) || '[]') || []; } catch (e) { app.cola = []; }
-  if (app.cola.length) {
-    toast(`Hay ${app.cola.length} libro(s) de una sesión anterior sin guardar. Guardándolos…`, 'info');
+  let guardado = null;
+  try { guardado = JSON.parse(localStorage.getItem(claveCola()) || 'null'); } catch (e) { /* dato corrupto */ }
+  // Versiones anteriores guardaban solo la lista de lecturas.
+  app.cola = Array.isArray(guardado) ? guardado : (guardado && guardado.lecturas) || [];
+  app.cierres = (guardado && !Array.isArray(guardado) && guardado.cierres) || [];
+
+  if (app.cola.length || app.cierres.length) {
+    const partes = [];
+    if (app.cola.length) partes.push(`${app.cola.length} libro(s) sin guardar`);
+    if (app.cierres.length) partes.push(`${app.cierres.length} caja(s) sin cerrar`);
+    toast(`De una sesión anterior quedaron ${partes.join(' y ')}. Enviándolos…`, 'info');
     procesarCola();
   }
   actualizarEstadoCola();
+}
+
+/**
+ * Deja el cierre de una caja para cuando vuelva la conexión: se manda solo,
+ * después de que se guarden todos sus libros pendientes.
+ */
+function encolarCierre(idCaja) {
+  if (!app.cierres.includes(idCaja)) app.cierres.push(idCaja);
+  guardarColaLocal();
+  procesarCola();
+}
+
+/** Red, timeout o servidor ocupado: vale la pena reintentar. */
+function esErrorReintentable(e) {
+  return ['RED', 'TIMEOUT', 'SIN_CONEXION'].includes(e.codigo) || /ocupado/i.test(e.message || '');
 }
 
 function encolarLectura(lectura) {
@@ -1470,14 +1511,20 @@ function pendientesDeCaja(idCaja) {
   return idCaja ? app.cola.filter((l) => l.caja === idCaja).length : app.cola.length;
 }
 
-/** Manda el próximo lote. Se llama sola mientras quede algo en la cola. */
+/**
+ * Manda lo próximo de la cola: primero los cierres de cajas cuyos libros ya
+ * están todos guardados, si no, un lote de libros. Se llama sola mientras quede algo.
+ */
 async function procesarCola() {
-  if (app.colaEnviando || !app.cola.length || !app.sesion) {
+  if (app.colaEnviando || (!app.cola.length && !app.cierres.length) || !app.sesion) {
     actualizarEstadoCola();
     return;
   }
   clearTimeout(app.colaTimer);
   app.colaTimer = null;
+
+  const cierre = app.cierres.find((c) => !pendientesDeCaja(c));
+  if (cierre) return procesarCierre(cierre);
 
   // Un lote es siempre de una sola caja (la primera de la cola).
   const caja = app.cola[0].caja;
@@ -1515,17 +1562,54 @@ async function procesarCola() {
     }
 
     // Red, timeout o servidor ocupado: se reintenta solo (el id evita duplicados).
-    app.colaSinConexion = true;
-    const espera = ESPERAS_REINTENTO_MS[Math.min(app.colaReintentos, ESPERAS_REINTENTO_MS.length - 1)];
-    app.colaReintentos++;
-    app.colaTimer = setTimeout(procesarCola, espera);
-    actualizarEstadoCola();
+    programarReintento();
     return;
   } finally {
     if (app.colaEnviando) app.colaEnviando = null;
   }
 
-  if (app.cola.length) procesarCola();
+  if (app.cola.length || app.cierres.length) procesarCola();
+  else actualizarEstadoCola();
+}
+
+function programarReintento() {
+  app.colaSinConexion = true;
+  const espera = ESPERAS_REINTENTO_MS[Math.min(app.colaReintentos, ESPERAS_REINTENTO_MS.length - 1)];
+  app.colaReintentos++;
+  app.colaTimer = setTimeout(procesarCola, espera);
+  actualizarEstadoCola();
+}
+
+/** Cierra en el servidor una caja que quedó con el cierre pendiente. */
+async function procesarCierre(idCaja) {
+  app.colaEnviando = new Set(['cierre:' + idCaja]);
+  actualizarEstadoCola();
+  try {
+    const r = await llamarServidor('cerrarCaja', app.sesion.token, idCaja);
+    app.cierres = app.cierres.filter((c) => c !== idCaja);
+    guardarColaLocal();
+    app.colaReintentos = 0;
+    app.colaSinConexion = false;
+    toast(r.yaEstabaCerrada
+      ? `La caja ${idCaja} ya estaba cerrada por ${r.usuarioCierre || 'otro usuario'}.`
+      : `Caja ${idCaja} cerrada (${r.cantidad} libros). Estaba pendiente por falta de conexión.`, 'success');
+  } catch (e) {
+    app.colaEnviando = null;
+    if (manejarErrorSesion(e)) return; // el cierre queda guardado para el próximo ingreso
+    if (esErrorReintentable(e)) {
+      programarReintento();
+      return;
+    }
+    // P. ej. la caja quedó vacía: no tiene sentido reintentar.
+    app.cierres = app.cierres.filter((c) => c !== idCaja);
+    guardarColaLocal();
+    toast(`No se pudo cerrar la caja ${idCaja}: ${e.message}`, 'danger');
+  } finally {
+    app.colaEnviando = null;
+  }
+
+  if ($('pantalla-menu').classList.contains('activa')) cargarCajas();
+  if (app.cola.length || app.cierres.length) procesarCola();
   else actualizarEstadoCola();
 }
 
@@ -1701,13 +1785,18 @@ async function onEnterBusqueda(evento) {
  *  CIERRE DE CAJA (automático y manual)
  * ========================================================================== */
 
-/** Pantalla de confirmación luego de cerrar la caja manualmente. */
-async function finalizarCaja() {
+/**
+ * Pantalla de confirmación luego de cerrar la caja manualmente.
+ * @param {boolean=} pendiente  Sin conexión: el cierre quedó en la cola.
+ */
+async function finalizarCaja(pendiente = false) {
   const idCaja = app.caja;
   const cantidad = app.cantidad;
 
-  $('completada-titulo').textContent = 'Caja cerrada';
-  $('completada-detalle').textContent = `Caja ${idCaja} · ${cantidad} libro(s)`;
+  $('completada-titulo').textContent = pendiente ? 'Caja lista para cerrar' : 'Caja cerrada';
+  $('completada-detalle').textContent = pendiente
+    ? `Caja ${idCaja} · ${cantidad} libro(s). No hay conexión: se cierra sola cuando vuelva.`
+    : `Caja ${idCaja} · ${cantidad} libro(s)`;
   $('overlay-completada').classList.add('visible');
   beep(880, 0.12); setTimeout(() => beep(1320, 0.18), 140);
   vibrar([100, 50, 100, 50, 200]);
@@ -1768,10 +1857,20 @@ async function sugerirCerrarCaja() {
 
 async function cerrarCajaActual() {
   if (!app.caja) return;
-  if (!(await esperarCola('Antes de cerrar: guardando'))) return;
+  const idCaja = app.caja;
+
+  // Sin conexión: el cierre queda en la cola y se manda solo cuando vuelva,
+  // después de que se guarden los libros pendientes de la caja.
+  if (!(await esperarCola('Antes de cerrar: guardando'))) {
+    if (!app.sesion) return; // venció la sesión: ya se volvió al login
+    encolarCierre(idCaja);
+    await finalizarCaja(true);
+    return;
+  }
+
   mostrarCargando('Cerrando caja…');
   try {
-    const r = await llamarServidor('cerrarCaja', app.sesion.token, app.caja);
+    const r = await llamarServidor('cerrarCaja', app.sesion.token, idCaja);
     app.cantidad = r.cantidad;
     ocultarCargando();
     if (r.yaEstabaCerrada) toast('La caja ya había sido cerrada por ' + (r.usuarioCierre || 'otro usuario') + '.', 'info');
@@ -1779,6 +1878,11 @@ async function cerrarCajaActual() {
   } catch (e) {
     ocultarCargando();
     if (manejarErrorSesion(e)) return;
+    if (esErrorReintentable(e)) {
+      encolarCierre(idCaja);
+      await finalizarCaja(true);
+      return;
+    }
     toast('No se pudo cerrar la caja: ' + e.message, 'danger');
   }
 }
@@ -2421,7 +2525,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Aviso del navegador si se intenta cerrar o recargar con libros sin guardar.
   window.addEventListener('beforeunload', (e) => {
-    if (!app.cola.length) return;
+    if (!app.cola.length && !app.cierres.length) return;
     e.preventDefault();
     e.returnValue = '';
   });
