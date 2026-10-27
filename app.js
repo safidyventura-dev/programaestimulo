@@ -45,6 +45,8 @@ const app = {
   indiceIsbn: new Map(),   // isbn (10 y 13) o issn -> item del catálogo
   catalogoListo: false,
   catalogoCargando: false,
+  sinCodigo: [],           // libros que se cargan por título (sin código de barras): [{ valor, titulo, editorial }]
+  sinCodigoVerTodos: false,
 
   /** Límite sugerido (blando) de libros por caja; se actualiza desde el servidor. */
   limite: 20,
@@ -253,6 +255,7 @@ function irAlEmpaquetado() {
   detenerAutoRefrescoAdmin();
   mostrarMenu();
   cargarCatalogo(); // en segundo plano
+  cargarSinCodigo();
 }
 
 async function onLogout() {
@@ -299,6 +302,9 @@ function cerrarSesionLocal() {
   app.indiceIsbn = new Map();
   app.catalogoListo = false;
   app.catalogoCargando = false;
+  app.sinCodigo = [];
+  app.sinCodigoVerTodos = false;
+  renderSinCodigo();
 
   ocultarCargando();
   $('overlay-completada').classList.remove('visible');
@@ -781,6 +787,75 @@ function onClickResultado(evento) {
       actualizarInfoBusqueda();
     }
   });
+}
+
+/* ============================================================================
+ *  SELECTOR RÁPIDO "SIN CÓDIGO"
+ *  Los libros que se cargan por título (no traen código de barras impreso),
+ *  de los más cargados a los menos, para anotarlos con un toque sin buscar.
+ * ========================================================================== */
+
+/** Cuántos se muestran antes de "Ver todos". */
+const SIN_CODIGO_VISIBLES = 6;
+
+async function cargarSinCodigo() {
+  if (!app.sesion) return;
+  try {
+    const filas = await llamarServidor('getSinCodigo', app.sesion.token);
+    const servidor = filas.map(([valor, titulo, editorial]) => ({
+      valor: String(valor || ''), titulo: String(titulo || ''), editorial: String(editorial || '')
+    }));
+    // Los que se cargaron en este celular y todavía no llegaron al servidor quedan al final.
+    const locales = app.sinCodigo.filter((l) => !servidor.some((s) => s.valor === l.valor));
+    app.sinCodigo = servidor.concat(locales);
+    renderSinCodigo();
+  } catch (e) {
+    manejarErrorSesion(e); // si falla, el selector sigue como estaba (es solo un atajo)
+  }
+}
+
+/** Suma a la lista un libro recién elegido por título (sin reordenar lo que ya se ve). */
+function sumarSinCodigo(libro) {
+  if (app.sinCodigo.some((l) => l.valor === libro.valor)) return;
+  app.sinCodigo.push({ valor: libro.valor, titulo: libro.titulo || libro.valor, editorial: libro.editorial || '' });
+  renderSinCodigo();
+}
+
+function renderSinCodigo() {
+  const contenedor = $('sin-codigo');
+  contenedor.classList.toggle('d-none', !app.sinCodigo.length);
+  if (!app.sinCodigo.length) { contenedor.innerHTML = ''; return; }
+
+  const visibles = app.sinCodigoVerTodos ? app.sinCodigo : app.sinCodigo.slice(0, SIN_CODIGO_VISIBLES);
+  const ocultos = app.sinCodigo.length - visibles.length;
+  contenedor.innerHTML = `
+    <div class="small fw-semibold text-body-secondary mb-2">
+      <i class="bi bi-lightning-charge"></i> Sin código de barras · tocá para cargar
+    </div>
+    <div class="d-flex flex-wrap gap-2">
+      ${visibles.map((l, idx) => `
+        <button type="button" class="btn btn-outline-secondary chip-sin-codigo" data-sin-codigo="${idx}"
+          title="${escaparHtml(l.titulo + (l.editorial ? ' · ' + l.editorial : ''))}">
+          <span class="chip-titulo">${escaparHtml(l.titulo)}</span>
+          ${l.editorial ? `<span class="d-block text-truncate small text-body-secondary">${escaparHtml(l.editorial)}</span>` : ''}
+        </button>`).join('')}
+      ${ocultos > 0 || app.sinCodigoVerTodos ? `
+        <button type="button" class="btn btn-link btn-sm w-100" data-sin-codigo-todos>
+          ${app.sinCodigoVerTodos ? 'Ver menos' : `Ver todos (${app.sinCodigo.length})`}
+        </button>` : ''}
+    </div>`;
+}
+
+function onClickSinCodigo(evento) {
+  if (evento.target.closest('[data-sin-codigo-todos]')) {
+    app.sinCodigoVerTodos = !app.sinCodigoVerTodos;
+    renderSinCodigo();
+    return;
+  }
+  const boton = evento.target.closest('[data-sin-codigo]');
+  if (!boton) return;
+  const libro = app.sinCodigo[Number(boton.dataset.sinCodigo)];
+  if (libro) ingresarLibro({ valor: libro.valor, titulo: libro.titulo, editorial: libro.editorial, origen: 'rapido' });
 }
 
 function actualizarInfoBusqueda() {
@@ -1399,6 +1474,7 @@ async function ingresarLibro(libro) {
     valor: libro.valor,
     titulo: libro.titulo || '',
     editorial: libro.editorial || '',
+    origen: libro.origen || '',
     edicion: app.edicion
   };
   app.contenido.push({
@@ -1412,6 +1488,7 @@ async function ingresarLibro(libro) {
   });
   app.cantidad++;
   encolarLectura(lectura);
+  if (libro.origen === 'busqueda') sumarSinCodigo(libro);
 
   actualizarContador();
   renderContenido();
@@ -1534,7 +1611,7 @@ async function procesarCola() {
 
   try {
     const r = await llamarServidor('registrarLibros', app.sesion.token, caja,
-      lote.map(({ id, valor, titulo, editorial }) => ({ id, valor, titulo, editorial })),
+      lote.map(({ id, valor, titulo, editorial, origen }) => ({ id, valor, titulo, editorial, origen })),
       lote.some((l) => l.edicion)); // edición de una caja armada (solo Admin)
 
     quitarDeCola(app.colaEnviando);
@@ -2505,7 +2582,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (preferenciaTema() === 'auto') aplicarTema('auto');
   });
   $('btn-reintentar-catalogo').addEventListener('click', cargarCatalogo);
-  $('btn-actualizar-catalogo').addEventListener('click', () => cargarCatalogo(true));
+  $('btn-actualizar-catalogo').addEventListener('click', () => { cargarCatalogo(true); cargarSinCodigo(); });
+  $('sin-codigo').addEventListener('click', onClickSinCodigo);
 
   // Pantalla de caja
   document.querySelectorAll('input[name="modo"]').forEach((radio) => {
