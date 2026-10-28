@@ -43,6 +43,7 @@ const app = {
   sesion: null,            // { token, usuario, rol }
   catalogo: [],            // [{ isbn, titulo, editorial, norm, normTitulo }]
   indiceIsbn: new Map(),   // isbn (10 y 13) o issn -> item del catálogo
+  codigosBloqueados: new Map(), // código mal impreso -> items del catálogo que lo traen impreso
   catalogoListo: false,
   catalogoCargando: false,
   sinCodigo: [],           // libros que se cargan por título (sin código de barras): [{ valor, titulo, editorial }]
@@ -300,6 +301,8 @@ function cerrarSesionLocal() {
   app.colaReintentos = 0;
   app.catalogo = [];
   app.indiceIsbn = new Map();
+  app.codigosBloqueados = new Map();
+  app.resumen = null;
   app.catalogoListo = false;
   app.catalogoCargando = false;
   app.sinCodigo = [];
@@ -639,10 +642,12 @@ async function cargarCatalogo(forzar = false) {
     // La búsqueda manual es por título o editorial (el código se usa al escanear).
     // `isbn` guarda el código del catálogo, sea ISBN o ISSN.
     const recargado = app.catalogoListo;
-    app.catalogo = filas.map(([isbn, titulo, editorial]) => ({
+    app.catalogo = filas.map(([isbn, titulo, editorial, tipo, impresos]) => ({
       isbn: String(isbn || ''),
       titulo: String(titulo || ''),
       editorial: String(editorial || ''),
+      tipo: String(tipo || ''),
+      impresos: Array.isArray(impresos) ? impresos : [],
       normTitulo: normalizarTexto(titulo),
       norm: normalizarTexto(titulo + ' ' + (editorial || ''))
     }));
@@ -657,7 +662,10 @@ async function cargarCatalogo(forzar = false) {
       if (alt && !app.indiceIsbn.has(alt)) app.indiceIsbn.set(alt, item);
     });
 
+    reconstruirBloqueados();
+
     app.catalogoListo = true;
+    if ($('pantalla-libro').classList.contains('activa') && !app.intercambio) renderLibroDetalle();
     estadoCatalogo('ok', app.catalogo.length.toLocaleString('es-AR') + ' títulos listos');
     actualizarInfoBusqueda();
     if ($('input-busqueda').value) onInputBusqueda(); // refresca resultados ya mostrados
@@ -682,6 +690,20 @@ async function cargarCatalogo(forzar = false) {
   } finally {
     app.catalogoCargando = false;
   }
+}
+
+/** Índice de códigos mal impresos (en sus dos formas, si es ISBN) → libros que los traen. */
+function reconstruirBloqueados() {
+  app.codigosBloqueados = new Map();
+  app.catalogo.forEach((item) => {
+    item.impresos.forEach((codigo) => {
+      const alt = codigo.length === 10 ? isbn10a13(codigo) : codigo.length === 13 ? isbn13a10(codigo) : null;
+      [codigo, alt].filter(Boolean).forEach((c) => {
+        if (!app.codigosBloqueados.has(c)) app.codigosBloqueados.set(c, []);
+        app.codigosBloqueados.get(c).push(item);
+      });
+    });
+  });
 }
 
 /** Minúsculas, sin tildes y con espacios simples. */
@@ -1806,6 +1828,13 @@ async function resincronizarCaja() {
  * Si no está en el catálogo, pide confirmación.
  */
 async function procesarCodigo(texto, origen) {
+  // Antes de validar: un código mal impreso puede no pasar el dígito verificador.
+  const limpio = String(texto || '').replace(/[\s-]/g, '').toUpperCase();
+  if (app.codigosBloqueados.has(limpio)) {
+    avisarCodigoBloqueado(limpio);
+    return false;
+  }
+
   const v = validarCodigo(texto);
   if (!v) {
     destello('error');
@@ -1829,6 +1858,28 @@ async function procesarCodigo(texto, origen) {
 
   setFeedback('neutral', 'Ingreso cancelado', 'Probá de nuevo o buscá el libro por título.');
   return false;
+}
+
+/**
+ * El código está impreso por error en algún libro (y puede ser el de otro libro
+ * del catálogo): no se registra nada y se pasa al buscador para elegir por título.
+ */
+function avisarCodigoBloqueado(codigo) {
+  const libros = [buscarIsbnEnCatalogo(codigo), ...app.codigosBloqueados.get(codigo)]
+    .filter((l, i, todos) => l && todos.indexOf(l) === i);
+  const titulos = libros.map((l) => '«' + (l.titulo || l.isbn) + '»');
+  const lista = titulos.length > 1 ? titulos.slice(0, -1).join(', ') + ' y ' + titulos[titulos.length - 1] : titulos[0];
+
+  destello('alerta');
+  setFeedback('alerta', 'Código bloqueado: buscá el libro por título',
+    `El código ${etiquetaCodigo(codigo)} está impreso en ${lista}. Escribí el título del libro que tenés en la mano.`);
+  // Fuera del procesamiento de la lectura, para no pelear con la pausa de la cámara.
+  setTimeout(() => {
+    $('input-busqueda').value = '';
+    $('resultados-busqueda').innerHTML = '';
+    $('modo-busqueda').checked = true;
+    cambiarModo('busqueda');
+  }, 0);
 }
 
 /**
@@ -2443,6 +2494,457 @@ function onCambiarTema() {
 
 
 /* ============================================================================
+ *  LIBROS POR CAJA
+ *  Una tarjeta por libro con en cuántas cajas está (* = repetido en alguna).
+ *  Al tocarla se ve en qué cajas está y, abajo, en cuáles no. Tocando una caja
+ *  se cambia un libro por otro: la caja conserva su cantidad y su estado (si
+ *  estaba cerrada, sigue cerrada). Lo pueden usar Operarios y Admin.
+ * ========================================================================== */
+
+/** Valor del filtro de tipo para los libros sin Tipo en el catálogo. */
+const SIN_TIPO = '__sin_tipo__';
+
+function irALibros() {
+  app.librosVolverA = document.querySelector('.pantalla.activa').id;
+  detenerAutoRefrescoAdmin();
+  cargarCatalogo(); // para buscar el libro que entra en un cambio
+  mostrarPantalla('pantalla-libros');
+  cargarResumenLibros();
+}
+
+function volverDeLibros() {
+  if (app.librosVolverA === 'pantalla-admin') irAlPanel();
+  else mostrarMenu();
+}
+
+async function cargarResumenLibros() {
+  const btn = $('btn-libros-actualizar');
+  btn.disabled = true;
+  if (!app.resumen) $('libros-resumen').textContent = 'Cargando…';
+  try {
+    const r = await llamarServidor('getResumenLibros', app.sesion.token);
+    app.resumen = r;
+    app.limite = r.limite || app.limite;
+    app.resumenCajas = new Map(r.cajas.map((c) => [c.id, c]));
+    app.resumenLibros = new Map(r.libros.map((l) => [l.codigo, l]));
+    actualizarFiltroTipos();
+    renderLibros();
+    if ($('pantalla-libro').classList.contains('activa')) renderLibroDetalle();
+  } catch (e) {
+    if (manejarErrorSesion(e)) return;
+    $('libros-resumen').textContent = 'No se pudo cargar el listado.';
+    toast('No se pudo cargar el listado de libros: ' + e.message, 'danger');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function actualizarFiltroTipos() {
+  const select = $('libros-tipo');
+  const actual = select.value;
+  const tipos = [...new Set(app.resumen.libros.map((l) => l.tipo || SIN_TIPO))]
+    .sort((a, b) => (a === SIN_TIPO) - (b === SIN_TIPO) || a.localeCompare(b, 'es'));
+  select.innerHTML = '<option value="">Todos los tipos</option>' + tipos.map((t) =>
+    `<option value="${escaparHtml(t)}">${escaparHtml(t === SIN_TIPO ? 'Sin tipo' : t)}</option>`).join('');
+  select.value = tipos.includes(actual) ? actual : '';
+  select.classList.toggle('d-none', tipos.length < 2);
+}
+
+function esAudiolibro(tipo) {
+  return /audio/i.test(tipo || '');
+}
+
+function badgeTipo(tipo) {
+  if (!tipo) return '';
+  return esAudiolibro(tipo)
+    ? `<span class="badge text-bg-info"><i class="bi bi-headphones"></i> ${escaparHtml(tipo)}</span>`
+    : `<span class="badge text-bg-secondary"><i class="bi bi-book"></i> ${escaparHtml(tipo)}</span>`;
+}
+
+/** "🎧 7 · Texto 13" según el Tipo de los libros de una caja (vacío si no hay tipos cargados). */
+function mezclaTiposHtml(tipos) {
+  const entradas = Object.entries(tipos || {}).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  if (!entradas.some(([t]) => t)) return '';
+  return entradas.map(([t, n]) => esAudiolibro(t)
+    ? `<span title="${escaparHtml(t)}"><i class="bi bi-headphones"></i> ${n}</span>`
+    : `<span>${escaparHtml(t || 'Sin tipo')} ${n}</span>`).join(' · ');
+}
+
+function renderLibros() {
+  if (!app.resumen) return;
+  const palabras = normalizarTexto($('libros-buscar').value).split(' ').filter(Boolean);
+  const tipo = $('libros-tipo').value;
+  const soloRepetidos = $('libros-solo-repetidos').checked;
+  const orden = $('libros-orden').value;
+
+  const lista = app.resumen.libros.filter((l) => {
+    if (soloRepetidos && !l.cajas.some(([, v]) => v > 1)) return false;
+    if (tipo && (l.tipo || SIN_TIPO) !== tipo) return false;
+    const texto = normalizarTexto(l.titulo + ' ' + l.editorial) + ' ' + l.codigo.toLowerCase();
+    return palabras.every((p) => texto.includes(p));
+  });
+  const porTitulo = (a, b) => (a.titulo || a.codigo).localeCompare(b.titulo || b.codigo, 'es');
+  lista.sort((a, b) => orden === 'titulo' ? porTitulo(a, b)
+    : (orden === 'menos' ? a.cajas.length - b.cajas.length : b.cajas.length - a.cajas.length) || porTitulo(a, b));
+
+  const total = app.resumen.libros.length;
+  $('libros-resumen').textContent = (lista.length === total
+    ? `${total} título(s) cargados en cajas.`
+    : `${lista.length} de ${total} título(s).`) + ' Tocá uno para ver sus cajas.';
+  $('grilla-libros').innerHTML = lista.length
+    ? lista.map(tarjetaLibroHtml).join('')
+    : '<div class="text-body-secondary small" style="grid-column: 1 / -1;">No hay libros que coincidan.</div>';
+}
+
+function tarjetaLibroHtml(l) {
+  const ejemplares = l.cajas.reduce((s, [, v]) => s + v, 0);
+  const repetido = l.cajas.some(([, v]) => v > 1);
+  return `
+    <button type="button" class="tarjeta-libro ${repetido ? 'con-repetido' : ''}" data-libro="${escaparHtml(l.codigo)}">
+      <span class="tl-titulo">${escaparHtml(l.titulo || l.codigo)}</span>
+      ${l.editorial ? `<span class="small text-body-secondary text-truncate">${escaparHtml(l.editorial)}</span>` : ''}
+      <span class="mt-auto pt-1">${badgeTipo(l.tipo)}</span>
+      <span class="d-flex align-items-baseline gap-1">
+        <span class="tl-cajas">${l.cajas.length}${repetido ? '<span class="asterisco">*</span>' : ''}</span>
+        <span class="small text-body-secondary">${l.cajas.length === 1 ? 'caja' : 'cajas'}${ejemplares !== l.cajas.length ? ` · ${ejemplares} ej.` : ''}</span>
+      </span>
+    </button>`;
+}
+
+function onClickLibro(evento) {
+  const boton = evento.target.closest('[data-libro]');
+  const libro = boton && app.resumenLibros.get(boton.dataset.libro);
+  if (!libro) return;
+  app.libroSel = libro;
+  app.intercambio = null;
+  mostrarPantalla('pantalla-libro');
+  renderLibroDetalle();
+}
+
+/** El libro elegido con sus datos al día (si lo sacaron de todas las cajas, sin cajas). */
+function libroActual() {
+  return app.resumenLibros.get(app.libroSel.codigo) || Object.assign({}, app.libroSel, { cajas: [] });
+}
+
+/** Ítem del catálogo de un valor registrado (código, o título si no tiene código). */
+function itemCatalogoDe(valor) {
+  return buscarIsbnEnCatalogo(valor) || app.catalogo.find((i) => !i.isbn && i.titulo === valor) || null;
+}
+
+function renderLibroDetalle() {
+  if (!app.libroSel || !app.resumen) return;
+  if (app.intercambio) { renderIntercambio(); return; }
+
+  const l = libroActual();
+  const veces = new Map(l.cajas);
+  const item = itemCatalogoDe(l.codigo);
+  const tipo = l.tipo || (item && item.tipo) || '';
+  const ejemplares = l.cajas.reduce((s, [, v]) => s + v, 0);
+  const repetidas = l.cajas.filter(([, v]) => v > 1).length;
+  const porId = (a, b) => a.id.localeCompare(b.id, 'es', { numeric: true });
+
+  const esta = app.resumen.cajas.filter((c) => veces.has(c.id))
+    .sort((a, b) => veces.get(b.id) - veces.get(a.id) || porId(a, b));
+  // Primero las que tienen menos libros de su mismo tipo: las mejores para mechar.
+  const mismoTipo = (c) => c.tipos[tipo] || 0;
+  const noEsta = app.resumen.cajas.filter((c) => !veces.has(c.id))
+    .sort((a, b) => mismoTipo(a) - mismoTipo(b) || a.cantidad - b.cantidad || porId(a, b));
+
+  $('libro-detalle').innerHTML = `
+    <div class="card tarjeta-contador mb-3"><div class="card-body">
+      <div class="h5 fw-bold mb-1">${escaparHtml(l.titulo || l.codigo)}</div>
+      <div class="resultado-isbn mb-2">${l.editorial ? escaparHtml(l.editorial) + ' · ' : ''}${escaparHtml(etiquetaCodigo(l.codigo))}</div>
+      <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+        ${badgeTipo(tipo)}
+        <span class="badge text-bg-primary">En ${l.cajas.length} caja(s)</span>
+        ${ejemplares !== l.cajas.length ? `<span class="badge text-bg-light border">${ejemplares} ejemplares</span>` : ''}
+        ${repetidas ? `<span class="badge text-bg-warning"><i class="bi bi-exclamation-triangle"></i> Repetido en ${repetidas} caja(s)</span>` : ''}
+      </div>
+      ${(item ? item.impresos : []).map((c) => `
+        <div class="alert alert-warning py-1 px-2 mb-2 d-flex align-items-center gap-2 small">
+          <i class="bi bi-slash-circle"></i>
+          <span class="flex-grow-1">Trae impreso <b>${escaparHtml(etiquetaCodigo(c))}</b> · código bloqueado</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary" style="min-height:32px;"
+                  data-quitar-impreso="${escaparHtml(c)}">Desbloquear</button>
+        </div>`).join('')}
+      ${item ? `<button type="button" class="btn btn-outline-warning btn-sm" style="min-height:36px;" data-accion="impreso">
+          <i class="bi bi-upc"></i> El código impreso en este libro está mal</button>` : ''}
+    </div></div>
+
+    <h3 class="h6 fw-bold mb-0">Está en ${esta.length} caja(s)</h3>
+    <div class="small text-body-secondary mb-2">Tocá una caja para sacar este libro y poner otro.</div>
+    <div class="list-group lista-cajas-libro">
+      ${esta.map((c) => filaCajaLibroHtml(c, veces.get(c.id))).join('') ||
+        '<div class="list-group-item small text-body-secondary">No está en ninguna caja.</div>'}
+    </div>
+
+    <div class="separador-no-esta">
+      <h3 class="h6 fw-bold mb-0">No está en ${noEsta.length} caja(s)</h3>
+      <div class="small text-body-secondary">
+        ${tipo ? `Primero las que tienen menos libros de tipo ${escaparHtml(tipo)}. ` : ''}Tocá una para sacar un libro y poner este.
+      </div>
+    </div>
+    <div class="list-group lista-cajas-libro lista-no-esta mb-4">
+      ${noEsta.map((c) => filaCajaLibroHtml(c, 0)).join('') ||
+        '<div class="list-group-item small text-body-secondary">Está en todas las cajas.</div>'}
+    </div>`;
+}
+
+function filaCajaLibroHtml(c, veces) {
+  const clase = c.cerrada ? 'text-bg-secondary' : c.cantidad > app.limite ? 'text-bg-danger' : 'text-bg-info';
+  return `
+    <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2 ${veces > 1 ? 'item-repetido' : ''}"
+            data-caja-libro="${escaparHtml(c.id)}">
+      <span class="flex-grow-1 text-truncate">
+        <span class="caja-id">${escaparHtml(c.id)}</span>
+        ${veces ? `<span class="fw-semibold ms-1">×${veces}${veces > 1 ? '<span class="asterisco">*</span>' : ''}</span>` : ''}
+        <span class="d-block mezcla-tipos text-truncate">${mezclaTiposHtml(c.tipos)}</span>
+      </span>
+      <span class="badge ${clase}">${c.cerrada ? '<i class="bi bi-lock-fill"></i> ' : ''}${c.cantidad}/${app.limite}</span>
+      <i class="bi bi-chevron-right text-body-secondary"></i>
+    </button>`;
+}
+
+/* ----------------------------------------------------------------------------
+ *  CAMBIAR UN LIBRO POR OTRO EN UNA CAJA
+ *  - La caja tiene el libro elegido → sale ese y se busca cuál entra.
+ *  - La caja no lo tiene → entra ese y se elige cuál sale de su contenido.
+ * -------------------------------------------------------------------------- */
+
+async function abrirIntercambio(idCaja) {
+  const tiene = libroActual().cajas.some(([id]) => id === idCaja);
+  const intercambio = { caja: idCaja, tiene: tiene, contenido: [] };
+  if (!tiene) {
+    mostrarCargando('Buscando contenido de ' + idCaja + '…');
+    try {
+      intercambio.contenido = (await llamarServidor('getContenidoCaja', app.sesion.token, idCaja)).libros;
+    } catch (e) {
+      if (!manejarErrorSesion(e)) toast(e.message, 'danger');
+      return;
+    } finally {
+      ocultarCargando();
+    }
+  }
+  app.intercambio = intercambio;
+  renderLibroDetalle();
+  window.scrollTo(0, 0);
+  if (tiene) setTimeout(() => $('intercambio-buscar').focus(), 50);
+}
+
+function renderIntercambio() {
+  const l = libroActual();
+  const it = app.intercambio;
+  const c = app.resumenCajas.get(it.caja) || { id: it.caja, cerrada: false, cantidad: 0, tipos: {} };
+  const titulo = escaparHtml(l.titulo || l.codigo);
+
+  let html = `
+    <div class="card tarjeta-contador mb-3"><div class="card-body">
+      <div class="d-flex align-items-center gap-2 mb-1">
+        <span class="h5 fw-bold mb-0">${escaparHtml(c.id)}</span>
+        <span class="badge ${c.cerrada ? 'text-bg-secondary' : 'text-bg-info'}">${c.cerrada ? '<i class="bi bi-lock-fill"></i> Cerrada' : 'Abierta'} · ${c.cantidad}/${app.limite}</span>
+      </div>
+      <div class="mezcla-tipos mb-2">${mezclaTiposHtml(c.tipos)}</div>
+      <div>${it.tiene
+        ? `<i class="bi bi-dash-circle text-danger"></i> Sale <b>${titulo}</b>. Elegí el libro que entra en su lugar.`
+        : `<i class="bi bi-plus-circle text-success"></i> Entra <b>${titulo}</b>. Elegí el libro que sale.`}</div>
+      ${c.cerrada ? '<div class="small text-body-secondary mt-1">La caja está cerrada y sigue cerrada.</div>' : ''}
+      <button type="button" class="btn btn-link px-0" data-intercambio-cancelar>Cancelar</button>
+    </div></div>`;
+
+  if (it.tiene) {
+    html += `
+      <div class="position-relative mb-2">
+        <i class="bi bi-search position-absolute text-body-secondary" style="left:14px; top:50%; transform:translateY(-50%);"></i>
+        <input type="search" class="form-control form-control-lg ps-5" id="intercambio-buscar"
+               placeholder="Libro que entra: título, editorial o ISBN" autocomplete="off" autocapitalize="none" spellcheck="false">
+      </div>
+      <div class="small text-body-secondary mb-2" id="intercambio-info">
+        ${app.catalogoListo ? 'Escribí al menos 2 letras.' : 'El catálogo todavía se está cargando…'}
+      </div>
+      <div class="list-group mb-4" id="intercambio-resultados"></div>`;
+  } else if (!it.contenido.length) {
+    html += '<div class="alert alert-secondary">La caja está vacía: no hay ningún libro para sacar.</div>';
+  } else {
+    html += '<div class="list-group mb-4">' + it.contenido.map((x, idx) => {
+      const tipo = (app.resumenLibros.get(x.codigo) || itemCatalogoDe(x.codigo) || {}).tipo || '';
+      return `
+        <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2 ${x.veces > 1 ? 'item-repetido' : ''}"
+                data-sacar-idx="${idx}">
+          <span class="flex-grow-1 text-truncate">
+            <span class="d-block fw-semibold text-truncate">${escaparHtml(x.titulo || x.codigo)}</span>
+            <span class="d-block resultado-isbn text-truncate">${x.editorial ? escaparHtml(x.editorial) + ' · ' : ''}${escaparHtml(etiquetaCodigo(x.codigo))}</span>
+          </span>
+          ${badgeTipo(tipo)}
+          ${x.veces > 1 ? `<span class="badge text-bg-warning">×${x.veces}</span>` : ''}
+          <i class="bi bi-box-arrow-right text-danger"></i>
+        </button>`;
+    }).join('') + '</div>';
+  }
+  $('libro-detalle').innerHTML = html;
+}
+
+/** Busca el libro que entra (por título/editorial o por código). */
+function onBuscarIntercambio() {
+  const texto = $('intercambio-buscar').value;
+  const limpio = texto.replace(/[\s-]/g, '').toUpperCase();
+  const actual = libroActual().codigo;
+  const encontrados = /^[0-9X]{8,13}$/.test(limpio)
+    ? [buscarIsbnEnCatalogo(limpio)].filter(Boolean)
+    : buscarEnCatalogo(texto);
+  const visibles = encontrados.filter((i) => (i.isbn || i.titulo) !== actual).slice(0, MAX_RESULTADOS_BUSQUEDA);
+  const contenedor = $('intercambio-resultados');
+  contenedor._items = visibles;
+
+  $('intercambio-info').textContent = !app.catalogoListo ? 'El catálogo todavía se está cargando…'
+    : normalizarTexto(texto).length < 2 ? 'Escribí al menos 2 letras.'
+    : !visibles.length ? 'Sin resultados.'
+    : 'Tocá el libro que entra. Al lado, en cuántas cajas está hoy.';
+
+  const palabras = normalizarTexto(texto).split(' ');
+  contenedor.innerHTML = visibles.map((i, idx) => {
+    const r = app.resumenLibros.get(i.isbn || i.titulo);
+    const enCajas = r ? r.cajas.length : 0;
+    return `
+      <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2" data-poner-idx="${idx}">
+        <span class="flex-grow-1 text-truncate">
+          <span class="d-block fw-semibold text-truncate">${resaltar(i.titulo || '(sin título)', palabras)}</span>
+          <span class="d-block resultado-isbn text-truncate">${i.editorial ? escaparHtml(i.editorial) + ' · ' : ''}${escaparHtml(etiquetaCodigo(i.isbn))}</span>
+        </span>
+        ${badgeTipo(i.tipo)}
+        <span class="badge ${enCajas ? 'text-bg-light border' : 'text-bg-success'}">${enCajas} caja(s)</span>
+      </button>`;
+  }).join('');
+}
+
+/** @param {{codigo:string, titulo:string}} sale  @param {{valor:string, titulo:string, editorial:string}} entra */
+async function ejecutarIntercambio(idCaja, sale, entra) {
+  const caja = app.resumenCajas.get(idCaja);
+  const ok = await confirmar('Cambiar libro',
+    `En la caja <b>${escaparHtml(idCaja)}</b>:<br>` +
+      `<i class="bi bi-dash-circle text-danger"></i> sale <b>${escaparHtml(sale.titulo)}</b> (1 ejemplar)<br>` +
+      `<i class="bi bi-plus-circle text-success"></i> entra <b>${escaparHtml(entra.titulo || entra.valor)}</b>` +
+      (caja && caja.cerrada ? '<div class="small text-body-secondary mt-2">La caja está cerrada y sigue cerrada.</div>' : ''),
+    'Cambiar', 'btn-primary');
+  if (!ok) return;
+
+  mostrarCargando('Cambiando libro…');
+  try {
+    await llamarServidor('intercambiarLibro', app.sesion.token, idCaja, sale.codigo, entra);
+    app.intercambio = null;
+    toast(`Caja ${idCaja}: salió "${sale.titulo}" y entró "${entra.titulo || entra.valor}".`, 'success');
+    await cargarResumenLibros();
+  } catch (e) {
+    if (!manejarErrorSesion(e)) toast('No se pudo cambiar el libro: ' + e.message, 'danger');
+  } finally {
+    ocultarCargando();
+  }
+}
+
+function onClickLibroDetalle(evento) {
+  const t = evento.target;
+  const it = app.intercambio;
+  const l = libroActual();
+
+  const caja = t.closest('[data-caja-libro]');
+  if (caja) return abrirIntercambio(caja.dataset.cajaLibro);
+  if (t.closest('[data-intercambio-cancelar]')) {
+    app.intercambio = null;
+    return renderLibroDetalle();
+  }
+  if (t.closest('[data-accion="impreso"]')) return onCodigoImpresoMal();
+  const desbloquear = t.closest('[data-quitar-impreso]');
+  if (desbloquear) return onDesbloquearCodigo(desbloquear.dataset.quitarImpreso);
+
+  const poner = t.closest('[data-poner-idx]');
+  if (poner && it) {
+    const i = $('intercambio-resultados')._items[Number(poner.dataset.ponerIdx)];
+    if (i) ejecutarIntercambio(it.caja, { codigo: l.codigo, titulo: l.titulo || l.codigo },
+      { valor: i.isbn || i.titulo, titulo: i.titulo, editorial: i.editorial });
+    return;
+  }
+  const sacar = t.closest('[data-sacar-idx]');
+  if (sacar && it) {
+    const x = it.contenido[Number(sacar.dataset.sacarIdx)];
+    if (x) ejecutarIntercambio(it.caja, { codigo: x.codigo, titulo: x.titulo || x.codigo },
+      { valor: l.codigo, titulo: l.titulo, editorial: l.editorial });
+  }
+}
+
+function onVolverDeLibro() {
+  if (app.intercambio) {
+    app.intercambio = null;
+    renderLibroDetalle();
+    return;
+  }
+  mostrarPantalla('pantalla-libros');
+}
+
+/* ----------------------------------------------------------------------------
+ *  CÓDIGOS MAL IMPRESOS
+ *  Algunos libros traen impreso el código de otro libro del catálogo. Ese
+ *  código se bloquea: al escanearlo no se registra nada y se pide el título.
+ * -------------------------------------------------------------------------- */
+
+async function onCodigoImpresoMal() {
+  const l = libroActual();
+  const item = itemCatalogoDe(l.codigo);
+  if (!item) return;
+
+  const pedido = confirmar('Código impreso mal',
+    `<p class="mb-2">Escribí el código que trae impreso <b>${escaparHtml(l.titulo || l.codigo)}</b> (el que está mal).</p>
+     <input type="text" class="form-control form-control-lg" id="input-codigo-impreso" inputmode="numeric"
+            autocomplete="off" spellcheck="false" placeholder="Código impreso en el libro">
+     <div class="small text-body-secondary mt-2">Ese código queda bloqueado: al escanearlo, la app no registra nada y pide buscar el libro por título.</div>`,
+    'Continuar', 'btn-warning');
+  setTimeout(() => { const i = $('input-codigo-impreso'); if (i) i.focus(); }, 400);
+  if (!(await pedido)) return;
+
+  const codigo = $('input-codigo-impreso').value.replace(/[\s-]/g, '').toUpperCase();
+  if (!/^[0-9X]{8,13}$/.test(codigo)) {
+    toast('El código tiene que tener entre 8 y 13 dígitos.', 'danger');
+    return;
+  }
+  if (codigo === item.isbn) {
+    toast('Ese es el código correcto del libro, no uno mal impreso.', 'warning');
+    return;
+  }
+
+  const otro = buscarIsbnEnCatalogo(codigo);
+  const ok = await confirmar('Bloquear código',
+    (otro && otro !== item
+      ? `El <b>${escaparHtml(etiquetaCodigo(codigo))}</b> es el código de <b>${escaparHtml(otro.titulo)}</b>, que también está en el catálogo.<br><br>`
+      : '') +
+    `Desde ahora, al escanear o tipear <b>${escaparHtml(etiquetaCodigo(codigo))}</b> habrá que buscar el libro por título.` +
+    '<div class="small text-body-secondary mt-2">Los libros que ya se cargaron con ese código no cambian: revisalos en sus cajas.</div>',
+    'Bloquear código', 'btn-warning');
+  if (ok) guardarCodigoImpreso(item, codigo, false);
+}
+
+async function onDesbloquearCodigo(codigo) {
+  const item = itemCatalogoDe(libroActual().codigo);
+  if (!item) return;
+  const ok = await confirmar('Desbloquear código',
+    `¿Desbloquear <b>${escaparHtml(etiquetaCodigo(codigo))}</b>? Al escanearlo se va a volver a registrar el libro que tenga ese código en el catálogo.`,
+    'Desbloquear', 'btn-primary');
+  if (ok) guardarCodigoImpreso(item, codigo, true);
+}
+
+async function guardarCodigoImpreso(item, codigo, quitar) {
+  mostrarCargando(quitar ? 'Desbloqueando código…' : 'Bloqueando código…');
+  try {
+    const r = await llamarServidor('marcarCodigoImpreso', app.sesion.token, item.isbn || item.titulo, codigo, quitar);
+    item.impresos = r.impresos;
+    reconstruirBloqueados(); // vale ya en este celular; los demás lo toman al actualizar el catálogo
+    toast(quitar ? 'Código desbloqueado.' : 'Código bloqueado.', 'success');
+    renderLibroDetalle();
+  } catch (e) {
+    if (!manejarErrorSesion(e)) toast('No se pudo guardar: ' + e.message, 'danger');
+  } finally {
+    ocultarCargando();
+  }
+}
+
+/* ============================================================================
  *  UTILIDADES DE UI
  * ========================================================================== */
 
@@ -2569,6 +3071,19 @@ document.addEventListener('DOMContentLoaded', () => {
   $('input-buscar-caja').addEventListener('input', renderCajas);
   $('input-buscar-caja').addEventListener('keydown', onEnterBuscarCaja);
   $('lista-cajas').addEventListener('click', onClickCaja);
+
+  // Libros por caja
+  document.querySelectorAll('.btn-ir-libros').forEach((b) => b.addEventListener('click', irALibros));
+  $('btn-libros-volver').addEventListener('click', volverDeLibros);
+  $('btn-libros-actualizar').addEventListener('click', cargarResumenLibros);
+  $('libros-buscar').addEventListener('input', renderLibros);
+  ['libros-orden', 'libros-tipo', 'libros-solo-repetidos'].forEach((id) => $(id).addEventListener('change', renderLibros));
+  $('grilla-libros').addEventListener('click', onClickLibro);
+  $('btn-libro-volver').addEventListener('click', onVolverDeLibro);
+  $('libro-detalle').addEventListener('click', onClickLibroDetalle);
+  $('libro-detalle').addEventListener('input', (e) => {
+    if (e.target.id === 'intercambio-buscar') onBuscarIntercambio();
+  });
 
   // Cámara
   $('btn-reintentar-camara').addEventListener('click', iniciarCamara);

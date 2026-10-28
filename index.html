@@ -258,6 +258,35 @@
     #resultado-consulta-caja .barra-seleccion { margin-bottom: .5rem; }
     .item-repetido { background: var(--bs-warning-bg-subtle) !important; border-left: 4px solid #fd7e14 !important; }
 
+    /* ---------- Libros por caja ---------- */
+    .grilla-libros { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+    @media (min-width: 768px) { .grilla-libros { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .tarjeta-libro {
+      display: flex; flex-direction: column; gap: .15rem;
+      text-align: left; width: 100%; min-height: 128px;
+      padding: .7rem .8rem;
+      border: 1px solid var(--bs-border-color-translucent);
+      border-radius: .9rem;
+      background: var(--pe-tarjeta); color: var(--bs-body-color);
+      box-shadow: var(--pe-sombra);
+    }
+    .tarjeta-libro:active { background: var(--bs-primary-bg-subtle); }
+    .tarjeta-libro.con-repetido { border-color: #fd7e14; }
+    .tl-titulo {
+      font-weight: 600; line-height: 1.2;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .tl-cajas { font-size: 1.6rem; font-weight: 800; line-height: 1; color: var(--pe-acento); font-variant-numeric: tabular-nums; }
+    .asterisco { color: #fd7e14; font-weight: 800; }
+    .lista-cajas-libro .list-group-item { padding: .65rem .9rem; }
+    .lista-no-esta .list-group-item { background: var(--bs-tertiary-bg); }
+    .separador-no-esta {
+      border-top: 3px dashed var(--bs-border-color);
+      margin: 1.5rem 0 .75rem; padding-top: .75rem;
+    }
+    .mezcla-tipos { font-size: .8rem; color: var(--bs-secondary-color); }
+    #intercambio-resultados { max-height: 50vh; overflow-y: auto; }
+
     /* ---------- Toasts ---------- */
     .toast-container { z-index: 3500; }
 
@@ -357,9 +386,14 @@
         </button>
       </div>
 
-      <button class="btn btn-primary btn-lg w-100 mb-3" id="btn-admin-empaquetar">
-        <i class="bi bi-box-seam me-1"></i> Armar cajas
-      </button>
+      <div class="d-flex gap-2 mb-3">
+        <button class="btn btn-primary btn-lg flex-fill" id="btn-admin-empaquetar">
+          <i class="bi bi-box-seam me-1"></i> Armar cajas
+        </button>
+        <button class="btn btn-outline-primary btn-lg flex-fill btn-ir-libros">
+          <i class="bi bi-journals me-1"></i> Libros por caja
+        </button>
+      </div>
 
       <div id="admin-error" class="alert alert-danger d-none"></div>
 
@@ -471,6 +505,63 @@
           </div>
         </div>
       </div>
+
+      <button class="btn btn-outline-primary btn-lg w-100 mt-3 btn-ir-libros">
+        <i class="bi bi-journals me-1"></i> Libros por caja
+      </button>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       PANTALLA: LIBROS POR CAJA (cada libro, en cuántas cajas está)
+       ========================================================= -->
+  <section id="pantalla-libros" class="pantalla">
+    <div class="container py-3" style="max-width: 900px;">
+      <button class="btn btn-link px-0 mb-1" id="btn-libros-volver">
+        <i class="bi bi-arrow-left"></i> Volver
+      </button>
+      <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
+        <h2 class="h5 fw-bold mb-0"><i class="bi bi-journals"></i> Libros por caja</h2>
+        <button class="btn btn-outline-secondary" type="button" id="btn-libros-actualizar" aria-label="Actualizar">
+          <i class="bi bi-arrow-clockwise"></i>
+        </button>
+      </div>
+
+      <div class="position-relative mb-2">
+        <i class="bi bi-search position-absolute text-body-secondary" style="left:14px; top:50%; transform:translateY(-50%);"></i>
+        <input type="search" class="form-control ps-5" id="libros-buscar"
+               placeholder="Título, editorial o ISBN…" autocomplete="off" autocapitalize="none" spellcheck="false">
+      </div>
+      <div class="d-flex flex-wrap gap-2 mb-2">
+        <select class="form-select flex-fill" id="libros-orden" style="width:auto;" aria-label="Ordenar">
+          <option value="mas">Más cajas primero</option>
+          <option value="menos">Menos cajas primero</option>
+          <option value="titulo">Por título</option>
+        </select>
+        <select class="form-select flex-fill" id="libros-tipo" style="width:auto;" aria-label="Tipo">
+          <option value="">Todos los tipos</option>
+        </select>
+      </div>
+      <div class="form-check mb-2">
+        <input class="form-check-input" type="checkbox" id="libros-solo-repetidos">
+        <label class="form-check-label small" for="libros-solo-repetidos">
+          Solo los repetidos en una misma caja (<span class="asterisco">*</span>)
+        </label>
+      </div>
+      <div class="small text-body-secondary mb-2" id="libros-resumen">Cargando…</div>
+      <div class="grilla-libros mb-4" id="grilla-libros"></div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       PANTALLA: DETALLE DE UN LIBRO (en qué cajas está y en cuáles no)
+       ========================================================= -->
+  <section id="pantalla-libro" class="pantalla">
+    <div class="container py-3" style="max-width: 640px;">
+      <button class="btn btn-link px-0 mb-1" id="btn-libro-volver">
+        <i class="bi bi-arrow-left"></i> Volver a los libros
+      </button>
+      <div id="libro-detalle"></div>
     </div>
   </section>
 
