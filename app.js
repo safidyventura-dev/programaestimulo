@@ -2589,25 +2589,43 @@ function renderLibros() {
 
   const total = app.resumen.libros.length;
   $('libros-resumen').textContent = (lista.length === total
-    ? `${total} título(s) cargados en cajas.`
+    ? `${total} título(s).`
     : `${lista.length} de ${total} título(s).`) + ' Tocá uno para ver sus cajas.';
   $('grilla-libros').innerHTML = lista.length
     ? lista.map(tarjetaLibroHtml).join('')
     : '<div class="text-body-secondary small" style="grid-column: 1 / -1;">No hay libros que coincidan.</div>';
 }
 
+/**
+ * Ejemplares repartidos en cajas contra los comprados (columna Comprados del
+ * Catalogo), o null si no se cargó cuántos se compraron.
+ * @return {{clase:'completo'|'sobran'|'excedido', texto:string}|null}
+ */
+function estadoComprados(l) {
+  if (l.comprados == null) return null;
+  const repartidos = l.cajas.reduce((s, [, v]) => s + v, 0);
+  const dif = l.comprados - repartidos;
+  return {
+    clase: dif === 0 ? 'completo' : dif > 0 ? 'sobran' : 'excedido',
+    texto: `${repartidos} de ${l.comprados}` + (dif > 0 ? ` · sobran ${dif}` : dif < 0 ? ` · ${-dif} de más` : '')
+  };
+}
+
 function tarjetaLibroHtml(l) {
   const ejemplares = l.cajas.reduce((s, [, v]) => s + v, 0);
   const repetido = l.cajas.some(([, v]) => v > 1);
+  const comprados = estadoComprados(l);
   return `
-    <button type="button" class="tarjeta-libro ${repetido ? 'con-repetido' : ''}" data-libro="${escaparHtml(l.codigo)}">
+    <button type="button" class="tarjeta-libro ${repetido ? 'con-repetido' : ''} ${comprados ? 'estado-' + comprados.clase : ''}"
+            data-libro="${escaparHtml(l.codigo)}">
       <span class="tl-titulo">${escaparHtml(l.titulo || l.codigo)}</span>
       ${l.editorial ? `<span class="small text-body-secondary text-truncate">${escaparHtml(l.editorial)}</span>` : ''}
       <span class="mt-auto pt-1">${badgeTipo(l.tipo)}</span>
       <span class="d-flex align-items-baseline gap-1">
         <span class="tl-cajas">${l.cajas.length}${repetido ? '<span class="asterisco">*</span>' : ''}</span>
-        <span class="small text-body-secondary">${l.cajas.length === 1 ? 'caja' : 'cajas'}${ejemplares !== l.cajas.length ? ` · ${ejemplares} ej.` : ''}</span>
+        <span class="small text-body-secondary">${l.cajas.length === 1 ? 'caja' : 'cajas'}${!comprados && ejemplares !== l.cajas.length ? ` · ${ejemplares} ej.` : ''}</span>
       </span>
+      ${comprados ? `<span class="small fw-semibold tl-comprados">${comprados.texto}</span>` : ''}
     </button>`;
 }
 
@@ -2641,6 +2659,8 @@ function renderLibroDetalle() {
   const tipo = l.tipo || (item && item.tipo) || '';
   const ejemplares = l.cajas.reduce((s, [, v]) => s + v, 0);
   const repetidas = l.cajas.filter(([, v]) => v > 1).length;
+  const comprados = estadoComprados(l);
+  const claseComprados = { completo: 'text-bg-success', sobran: 'text-bg-warning', excedido: 'text-bg-danger' };
   const porId = (a, b) => a.id.localeCompare(b.id, 'es', { numeric: true });
 
   const esta = app.resumen.cajas.filter((c) => veces.has(c.id))
@@ -2657,7 +2677,9 @@ function renderLibroDetalle() {
       <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
         ${badgeTipo(tipo)}
         <span class="badge text-bg-primary">En ${l.cajas.length} caja(s)</span>
-        ${ejemplares !== l.cajas.length ? `<span class="badge text-bg-light border">${ejemplares} ejemplares</span>` : ''}
+        ${comprados
+          ? `<span class="badge ${claseComprados[comprados.clase]}">Repartidos ${comprados.texto}</span>`
+          : ejemplares !== l.cajas.length ? `<span class="badge text-bg-light border">${ejemplares} ejemplares</span>` : ''}
         ${repetidas ? `<span class="badge text-bg-warning"><i class="bi bi-exclamation-triangle"></i> Repetido en ${repetidas} caja(s)</span>` : ''}
       </div>
       ${(item ? item.impresos : []).map((c) => `
@@ -2804,6 +2826,7 @@ function onBuscarIntercambio() {
   contenedor.innerHTML = visibles.map((i, idx) => {
     const r = app.resumenLibros.get(i.isbn || i.titulo);
     const enCajas = r ? r.cajas.length : 0;
+    const comprados = r && estadoComprados(r);
     return `
       <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2" data-poner-idx="${idx}">
         <span class="flex-grow-1 text-truncate">
@@ -2811,7 +2834,8 @@ function onBuscarIntercambio() {
           <span class="d-block resultado-isbn text-truncate">${i.editorial ? escaparHtml(i.editorial) + ' · ' : ''}${escaparHtml(etiquetaCodigo(i.isbn))}</span>
         </span>
         ${badgeTipo(i.tipo)}
-        <span class="badge ${enCajas ? 'text-bg-light border' : 'text-bg-success'}">${enCajas} caja(s)</span>
+        <span class="badge ${comprados && comprados.clase === 'sobran' ? 'text-bg-success' : 'text-bg-light border'}">
+          ${comprados ? comprados.texto : enCajas + ' caja(s)'}</span>
       </button>`;
   }).join('');
 }

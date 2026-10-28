@@ -278,6 +278,13 @@
     }
     .tl-cajas { font-size: 1.6rem; font-weight: 800; line-height: 1; color: var(--pe-acento); font-variant-numeric: tabular-nums; }
     .asterisco { color: #fd7e14; font-weight: 800; }
+    /* Repartidos contra comprados */
+    .tarjeta-libro.estado-completo { background: var(--bs-success-bg-subtle); }
+    .tarjeta-libro.estado-sobran   { background: var(--bs-warning-bg-subtle); }
+    .tarjeta-libro.estado-excedido { background: var(--bs-danger-bg-subtle); }
+    .estado-completo .tl-comprados { color: var(--bs-success-text-emphasis); }
+    .estado-sobran .tl-comprados   { color: var(--bs-warning-text-emphasis); }
+    .estado-excedido .tl-comprados { color: var(--bs-danger-text-emphasis); }
     .lista-cajas-libro .list-group-item { padding: .65rem .9rem; }
     .lista-no-esta .list-group-item { background: var(--bs-tertiary-bg); }
     .separador-no-esta {
