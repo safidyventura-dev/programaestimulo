@@ -1861,6 +1861,39 @@ async function procesarCodigo(texto, origen) {
 }
 
 /**
+ * Lectura de la cámara o de una foto: un Data Matrix no tiene por qué ser un
+ * ISBN, así que no pasa por la validación de los códigos de barras.
+ * @param {string} texto
+ * @param {Object} resultado  Resultado de html5-qrcode (trae el formato leído).
+ */
+function procesarLectura(texto, resultado) {
+  const formato = resultado && resultado.result && resultado.result.format;
+  return formato && formato.format === Html5QrcodeSupportedFormats.DATA_MATRIX
+    ? procesarDataMatrix(texto, 'escaner')
+    : procesarCodigo(texto, 'escaner');
+}
+
+/**
+ * Registra el contenido del Data Matrix tal como viene, sin pedir confirmación.
+ * Si adentro hay un ISBN/ISSN válido se usa el catálogo como con cualquier código.
+ */
+async function procesarDataMatrix(texto, origen) {
+  // Sin caracteres de control (los GS1 traen separadores invisibles); la planilla admite hasta 300.
+  const valor = String(texto || '').replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 300);
+  if (!valor) {
+    destello('error');
+    setFeedback('error', 'Código vacío', 'El Data Matrix no tiene contenido. Probá de nuevo o buscá el libro por título.');
+    return false;
+  }
+
+  const v = validarCodigo(valor);
+  const limpio = valor.replace(/[\s-]/g, '').toUpperCase();
+  if (app.codigosBloqueados.has(limpio) || (v && buscarIsbnEnCatalogo(v.codigo))) return procesarCodigo(valor, origen);
+
+  return ingresarLibro({ valor: v ? v.codigo : valor, titulo: '', editorial: '', origen });
+}
+
+/**
  * El código está impreso por error en algún libro (y puede ser el de otro libro
  * del catálogo): no se registra nada y se pasa al buscador para elegir por título.
  */
@@ -2102,7 +2135,7 @@ const PAUSA_MISMO_CODIGO_MS = 2500;
 
 function formatosEscaner() {
   const F = Html5QrcodeSupportedFormats;
-  return [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39];
+  return [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.DATA_MATRIX];
 }
 
 /** La cámara debe estar prendida solo en la pantalla de caja, modo escáner y pestaña visible. */
@@ -2200,7 +2233,7 @@ function estadoCamara(tipo, texto) {
   $('camara-estado-texto').textContent = texto || '';
 }
 
-async function onLecturaCamara(texto) {
+async function onLecturaCamara(texto, resultado) {
   const ahora = Date.now();
   // No se lee mientras hay otro proceso o un aviso abierto (p. ej. "¿Sacar libro?").
   if (app.procesandoLectura || app.enviando || app.modalAbierto) return;
@@ -2218,7 +2251,7 @@ async function onLecturaCamara(texto) {
   try { app.camara.pause(true); } catch (e) { /* no estaba escaneando */ }
 
   try {
-    await procesarCodigo(texto, 'escaner');
+    await procesarLectura(texto, resultado);
   } finally {
     app.ultimaLecturaTs = Date.now();
     $('visor-camara').classList.remove('leyendo');
@@ -2397,9 +2430,9 @@ async function onFotoSeleccionada(evento) {
   estadoBotonFoto(true);
   setFeedback('proceso', 'Leyendo el código…', 'Analizando la foto.');
 
-  let codigo = null;
+  let lectura = null;
   try {
-    codigo = await leerCodigoDeFoto(archivo);
+    lectura = await leerCodigoDeFoto(archivo);
   } catch (e) {
     destello('error');
     setFeedback('error', 'No se pudo leer el código',
@@ -2410,15 +2443,14 @@ async function onFotoSeleccionada(evento) {
     estadoBotonFoto(false);
   }
 
-  await procesarCodigo(codigo, 'escaner');
+  await procesarLectura(lectura.decodedText, lectura);
 }
 
 /** Intenta decodificar primero una versión reducida (rápida) y luego la original. */
 async function leerCodigoDeFoto(archivo) {
   if (!app.lectorFoto) {
-    const F = Html5QrcodeSupportedFormats;
     app.lectorFoto = new Html5Qrcode('lector-archivo', {
-      formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39],
+      formatsToSupport: formatosEscaner(),
       experimentalFeatures: { useBarCodeDetectorIfSupported: true },
       verbose: false
     });
@@ -2426,9 +2458,9 @@ async function leerCodigoDeFoto(archivo) {
 
   try {
     const reducida = await reducirImagen(archivo, LADO_MAX_FOTO_PX);
-    return await app.lectorFoto.scanFile(reducida, false);
+    return await app.lectorFoto.scanFileV2(reducida, false);
   } catch (e) {
-    return await app.lectorFoto.scanFile(archivo, false);
+    return await app.lectorFoto.scanFileV2(archivo, false);
   }
 }
 
