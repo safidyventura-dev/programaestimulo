@@ -231,6 +231,7 @@ function iniciarSesion(sesion) {
   if (sesion.maxLibros) app.limite = sesion.maxLibros;
   guardarSesionLocal(app.sesion);
   cargarColaLocal();
+  prepararLectorDataMatrix(); // en segundo plano, para que la cámara arranque sin demora
 
   $('barra-usuario').textContent = sesion.usuario + ' · ' + sesion.rol;
 
@@ -2133,6 +2134,39 @@ function salirDeEdicion(idCaja) {
 /** Tiempo que el mismo código tiene que dejar de verse para volver a leerse. */
 const PAUSA_MISMO_CODIGO_MS = 2500;
 
+/** Máximo que se espera al lector más fuerte antes de seguir con el de html5-qrcode. */
+const ESPERA_LECTOR_MS = 6000;
+let lectorDataMatrixListo = null;
+
+/**
+ * El lector propio de html5-qrcode no lee un Data Matrix torcido más de unos
+ * 5°. Si el navegador no trae un BarcodeDetector con Data Matrix, se instala
+ * uno basado en zxing-wasm, que html5-qrcode usa solo. Si no llega a cargar
+ * (p. ej. sin conexión), se sigue con el lector de html5-qrcode.
+ */
+function prepararLectorDataMatrix() {
+  if (!lectorDataMatrixListo) {
+    lectorDataMatrixListo = (async () => {
+      try {
+        if ('BarcodeDetector' in window &&
+            (await window.BarcodeDetector.getSupportedFormats()).includes('data_matrix')) return;
+        const api = window.BarcodeDetectionAPI;
+        if (!api) return;
+
+        // La primera lectura baja el wasm: recién si funciona se reemplaza el detector.
+        const prueba = document.createElement('canvas');
+        prueba.width = prueba.height = 16;
+        await Promise.race([
+          new api.BarcodeDetector({ formats: ['data_matrix'] }).detect(prueba),
+          new Promise((_, rechazar) => setTimeout(() => rechazar(new Error('tiempo agotado')), ESPERA_LECTOR_MS))
+        ]);
+        window.BarcodeDetector = api.BarcodeDetector;
+      } catch (e) { /* se sigue con el lector de html5-qrcode */ }
+    })();
+  }
+  return lectorDataMatrixListo;
+}
+
 function formatosEscaner() {
   const F = Html5QrcodeSupportedFormats;
   return [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.DATA_MATRIX];
@@ -2156,6 +2190,7 @@ async function iniciarCamara() {
   app.camaraIniciando = true;
   estadoCamara('cargando', 'Iniciando cámara…');
   try {
+    await prepararLectorDataMatrix();
     if (!app.camara) {
       app.camara = new Html5Qrcode('lector-vivo', {
         formatsToSupport: formatosEscaner(),
@@ -2179,6 +2214,9 @@ async function iniciarCamara() {
     // Si mientras arrancaba el usuario cambió de modo o salió de la caja.
     if (!camaraDebeEstarActiva()) await detenerCamara();
   } catch (e) {
+    // Un arranque fallido puede dejar a html5-qrcode trabado: "Activar cámara" empieza de cero.
+    app.camara = null;
+    $('lector-vivo').innerHTML = '';
     const nombre = (e && e.name) || String(e);
     const mensaje = /NotAllowed|Permission/i.test(nombre)
       ? 'No hay permiso para usar la cámara. Habilitalo desde el candado de la barra de direcciones y tocá "Activar cámara".'
@@ -2204,8 +2242,8 @@ async function arrancarCamara(deviceId) {
     { facingMode: 'environment' },
     {
       fps: 12,
-      // Recuadro ancho y bajo: el formato de un código de barras.
-      qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(Math.min(h * 0.55, w * 0.45)) }),
+      // Recuadro ancho para los códigos de barras y alto para que entre un Data Matrix de cerca.
+      qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(Math.min(h * 0.85, w * 0.7)) }),
       videoConstraints
     },
     onLecturaCamara,
@@ -2448,6 +2486,7 @@ async function onFotoSeleccionada(evento) {
 
 /** Intenta decodificar primero una versión reducida (rápida) y luego la original. */
 async function leerCodigoDeFoto(archivo) {
+  await prepararLectorDataMatrix();
   if (!app.lectorFoto) {
     app.lectorFoto = new Html5Qrcode('lector-archivo', {
       formatsToSupport: formatosEscaner(),
